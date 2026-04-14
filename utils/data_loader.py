@@ -1,5 +1,6 @@
 """
 读取 weather.csv，滑动窗口构造 (历史, 未来) 样本，按时间顺序划分 train/val/test。
+仅在训练集「未来窗口」上估计边际 μ/σ，供无真值推理时 inverse_transform_future（不涉及测试标签）。
 """
 from __future__ import annotations
 
@@ -42,7 +43,6 @@ def load_weather_matrix(csv_path: Path) -> tuple[np.ndarray, list[str]]:
         df = df.drop(columns=["date"])
     feature_names = list(df.columns)
     values = df.values.astype(np.float32)
-    # 简单处理缺失
     if np.isnan(values).any():
         col_mean = np.nanmean(values, axis=0)
         inds = np.where(np.isnan(values))
@@ -51,16 +51,27 @@ def load_weather_matrix(csv_path: Path) -> tuple[np.ndarray, list[str]]:
     return values, feature_names
 
 
-def fit_global_standardizer(train_matrix: np.ndarray, abs_floor: float = 1e-3, rel_floor: float = 1e-4) -> tuple[np.ndarray, np.ndarray]:
+def fit_future_marginal_stats(
+    train_ds: WeatherWindowDataset,
+    abs_floor: float = 1e-3,
+    rel_floor: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    在训练集全时段上估计每维 mean/std。
-    std 设下限：max(经验std, abs_floor, rel_floor * max(|mean|, 1))，避免近常数列除零爆炸。
+    仅用训练集中每个样本的 **未来窗口** (Lf, C) 聚合，得到每通道边际 mean/std。
+    不拼接历史段，不把历史与未来放在同一向量里算统计量。
     """
-    mean = train_matrix.mean(axis=0).astype(np.float32)
-    raw_std = train_matrix.std(axis=0).astype(np.float32)
-    rel = rel_floor * np.maximum(np.abs(mean), 1.0).astype(np.float32)
-    std = np.maximum(np.maximum(raw_std, abs_floor), rel).astype(np.float32)
-    return mean, std
+    if len(train_ds) == 0:
+        raise ValueError("训练集为空，无法估计未来边际统计量")
+    futs = []
+    for i in range(len(train_ds)):
+        _, f = train_ds[i]
+        futs.append(f.numpy())
+    F = np.stack(futs, axis=0).astype(np.float32)  # (N, Lf, C)
+    mu = F.mean(axis=(0, 1))
+    raw_std = F.std(axis=(0, 1))
+    rel = rel_floor * np.maximum(np.abs(mu), 1.0).astype(np.float32)
+    sig = np.maximum(np.maximum(raw_std, abs_floor), rel).astype(np.float32)
+    return mu.astype(np.float32), sig.astype(np.float32)
 
 
 def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, list[str]]:
@@ -79,17 +90,25 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
     val_mat = matrix[train_end:val_end]
     test_mat = matrix[val_end:]
 
+    train_ds = WeatherWindowDataset(train_mat, cfg.seq_len, cfg.pred_len)
+    val_ds = WeatherWindowDataset(val_mat, cfg.seq_len, cfg.pred_len)
+    test_ds = WeatherWindowDataset(test_mat, cfg.seq_len, cfg.pred_len)
+
+    fut_mu, fut_sig = fit_future_marginal_stats(train_ds)
+    cfg.train_future_marginal_mean = fut_mu
+    cfg.train_future_marginal_std = fut_sig
+
     if cfg.use_global_standardization:
-        g_mean, g_std = fit_global_standardizer(train_mat)
+        # 保留字段供旧 checkpoint / 外部工具；SimDiff 核心路径已改用窗口独立归一化
+        g_mean = train_mat.mean(axis=0).astype(np.float32)
+        g_std = train_mat.std(axis=0).astype(np.float32)
+        rel = 1e-4 * np.maximum(np.abs(g_mean), 1.0).astype(np.float32)
+        g_std = np.maximum(np.maximum(g_std, 1e-3), rel).astype(np.float32)
         cfg.global_mean = g_mean
         cfg.global_std = g_std
     else:
         cfg.global_mean = None
         cfg.global_std = None
-
-    train_ds = WeatherWindowDataset(train_mat, cfg.seq_len, cfg.pred_len)
-    val_ds = WeatherWindowDataset(val_mat, cfg.seq_len, cfg.pred_len)
-    test_ds = WeatherWindowDataset(test_mat, cfg.seq_len, cfg.pred_len)
 
     train_loader = DataLoader(
         train_ds,

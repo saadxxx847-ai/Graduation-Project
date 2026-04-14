@@ -20,6 +20,14 @@ if str(ROOT) not in sys.path:
 
 from config.config import Config
 from models.simdiff import SimDiffWeather
+from utils.baselines import (
+    eval_channel_mse_mae,
+    eval_forecasts_mse_mae,
+    fit_dlinear,
+    moving_average_forecast,
+    persistence_forecast,
+    print_baseline_block,
+)
 from utils.data_loader import make_loaders
 from utils.trainer import Trainer
 
@@ -44,7 +52,7 @@ def evaluate_test_loader(
     device: torch.device,
     n_features: int,
 ) -> tuple[float, float, np.ndarray, np.ndarray]:
-    """全测试集：整体 MSE/MAE 与每通道 MAE/MSE（原始物理尺度）。"""
+    """全测试集：默认 **MoM 点预测** 的 MSE/MAE（原始物理尺度）；传 future 用本窗 μ_f,σ_f 反变换。"""
     model.eval()
     sum_sq = 0.0
     sum_abs = 0.0
@@ -54,7 +62,8 @@ def evaluate_test_loader(
     for hist, fut in test_loader:
         hist = hist.to(device)
         fut = fut.to(device)
-        pred = model.forecast(hist)
+        out = model.forecast(hist, future=fut)
+        pred = out.mom
         diff = pred - fut
         sum_sq += float((diff**2).sum().item())
         sum_abs += float(diff.abs().sum().item())
@@ -125,6 +134,28 @@ def main() -> None:
         action="store_true",
         help="跳过训练，只加载 checkpoints/simdiff_weather_best.pt 做测试。未训练时指标为随机权重，无意义。",
     )
+    parser.add_argument(
+        "--forecast_num_samples",
+        type=int,
+        default=None,
+        help="扩散独立采样次数 K（默认读 Config）；与 --mom_groups 配合做 MoM",
+    )
+    parser.add_argument(
+        "--mom_groups",
+        type=int,
+        default=None,
+        help="Median-of-Means 分组数 M（须整除 K；K=1 时须为 1）",
+    )
+    parser.add_argument(
+        "--skip_baselines",
+        action="store_true",
+        help="跳过 persistence / MA / DLinear 基线评估",
+    )
+    parser.add_argument(
+        "--verify_norm_mom",
+        action="store_true",
+        help="仅运行归一化/MoM 快速自检后退出（不训练）",
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -142,8 +173,23 @@ def main() -> None:
         cfg.sampling_mode = args.sampling_mode
     if args.sample_debug:
         cfg.sample_debug = True
+    if args.forecast_num_samples is not None:
+        cfg.forecast_num_samples = max(1, int(args.forecast_num_samples))
+    if args.mom_groups is not None:
+        cfg.mom_num_groups = max(1, int(args.mom_groups))
 
+    cfg.validate_mom_config()
+
+    set_seed(cfg.seed)
+    train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() and cfg.device == "cuda" else "cpu")
+
+    if args.verify_norm_mom:
+        import verify_norm_mom as vnm
+
+        vnm.run_quick_verify(cfg, train_loader, device)
+        return
+
     print("Device:", device)
     if (
         cfg.sampling_mode.lower() == "ddim"
@@ -156,21 +202,23 @@ def main() -> None:
         )
     print(
         f"采样: mode={cfg.sampling_mode}, steps={cfg.sampling_steps or cfg.timesteps}, "
-        f"ddim_eta={cfg.ddim_eta}"
+        f"ddim_eta={cfg.ddim_eta}, MoM: K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}"
     )
     print(
         f"训练噪声损失: MSE + L1×{cfg.training_noise_l1_weight} + "
         f"时间差分×{cfg.training_noise_temporal_diff_weight}"
     )
-    set_seed(cfg.seed)
-
-    train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
     print(f"特征维度 C={n_features}, 列名示例: {feat_names[:5]}...")
+    print(
+        f"Normalization Independence: 历史/未来分算 μ,σ；"
+        f"无真值反变换用训练集未来边际 std范围 "
+        f"[{np.asarray(cfg.train_future_marginal_std).min():.4g}, "
+        f"{np.asarray(cfg.train_future_marginal_std).max():.4g}]"
+    )
     if cfg.use_global_standardization and cfg.global_std is not None:
         gs = np.asarray(cfg.global_std)
         print(
-            f"全局标准化: std 范围 [{gs.min():.4g}, {gs.max():.4g}]；"
-            f"Z-score 裁剪 ±{cfg.z_clip}（再送入网络）"
+            f"（可选）全局统计 std 范围 [{gs.min():.4g}, {gs.max():.4g}]（SimDiff 主干未使用）"
         )
 
     model = SimDiffWeather(cfg).to(device)
@@ -190,23 +238,15 @@ def main() -> None:
             print(
                 f"已加载 checkpoint（epoch 记录: {state.get('epoch_trained', '未知')}）"
             )
-        if (
-            cfg.use_global_standardization
-            and cfg.global_mean is not None
-            and hasattr(model, "_g_mean")
-        ):
-            gm_buf = model._g_mean.squeeze().detach().cpu().numpy()
-            gm_cfg = np.asarray(cfg.global_mean, dtype=np.float64)
-            if gm_buf.shape == gm_cfg.shape:
-                d = float(np.abs(gm_buf - gm_cfg).max())
+        buf_m = model._fut_mu_marginal.squeeze().detach().cpu().numpy()
+        cfg_m = np.asarray(cfg.train_future_marginal_mean, dtype=np.float64)
+        if buf_m.shape == cfg_m.shape:
+            d = float(np.abs(buf_m - cfg_m).max())
+            print(f"反归一化检查: checkpoint 与当前训练集未来边际 mean 最大差 = {d:.6g}")
+            if d > 1e-2:
                 print(
-                    f"反归一化检查: checkpoint 内 global_mean 与当前数据估计的最大差 = {d:.6g}"
+                    "  [warn] 数据划分或数据文件变更后请重新训练，否则边际尺度不一致。"
                 )
-                if d > 1e-2:
-                    print(
-                        "  [warn] 若改过划分/数据或误删权重，mean/std 不一致会导致预测整体偏移；"
-                        "请用同一数据流程重训或确认加载了正确 checkpoint。"
-                    )
         model.eval()
     else:
         trainer = Trainer(cfg, model, train_loader, val_loader, device)
@@ -231,45 +271,99 @@ def main() -> None:
         hist, fut = next(iter(test_loader))
         hist = hist.to(device)
         fut = fut.to(device)
-        mse_s, mae_s = model.validation_mse(hist, fut)
+        out_s = model.forecast(hist, future=fut)
+        pred_m = out_s.mom
+        mse_s = torch.mean((pred_m - fut) ** 2)
+        mae_s = torch.mean(torch.abs(pred_m - fut))
+    t_idx = resolve_temperature_feature_index(feat_names)
+    temp_name = feat_names[t_idx] if t_idx < len(feat_names) else str(t_idx)
     print(
-        f"采样评估（单 batch，原始尺度）MSE: {mse_s.item():.6f} | MAE: {mae_s.item():.6f}"
+        f"采样评估（单 batch，MoM：K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}）\n"
+        f"  主变量 [{temp_name}] MSE: {torch.mean((pred_m[..., t_idx] - fut[..., t_idx]) ** 2).item():.6f} | "
+        f"MAE: {torch.mean(torch.abs(pred_m[..., t_idx] - fut[..., t_idx])).item():.6f}\n"
+        f"  全特征平均 MSE: {mse_s.item():.6f} | MAE: {mae_s.item():.6f}（辅助）"
     )
     mse_test, mae_test, mae_ch, mse_ch = evaluate_test_loader(
         model, test_loader, device, n_features
     )
-    t_idx = resolve_temperature_feature_index(feat_names)
     print(
-        f"全测试集（原始尺度）MSE: {mse_test:.6f} | MAE(全特征平均): {mae_test:.6f}"
+        f"\n【主结论 · 温度】{temp_name} — 全测试集 MSE: {mse_ch[t_idx]:.6f} | MAE: {mae_ch[t_idx]:.6f}"
     )
     print(
-        f"  温度列 [{feat_names[t_idx]}] MAE: {mae_ch[t_idx]:.6f} | "
-        f"MSE: {mse_ch[t_idx]:.6f}"
+        f"【辅助】全特征平均 MSE: {mse_test:.6f} | MAE: {mae_test:.6f}"
     )
-    print(
-        "说明：全特征平均 MAE 会被气压/OT 等大尺度列抬高；论文中建议报告温度等主变量 MAE。"
-    )
+
+    if not args.skip_baselines:
+        print("\n--- 基线（原始尺度，全测试集）---")
+        pl, sl, C = cfg.pred_len, cfg.seq_len, n_features
+
+        def wrap_persist(h):
+            return persistence_forecast(h, pl)
+
+        def wrap_ma(h):
+            return moving_average_forecast(h, pl, window=min(24, sl))
+
+        mse_b, mae_b = eval_forecasts_mse_mae(wrap_persist, test_loader, device)
+        mt_b, at_b = eval_channel_mse_mae(wrap_persist, test_loader, device, t_idx)
+        print_baseline_block("Persistence", mse_b, mae_b, mt_b, at_b, temp_name)
+
+        mse_b, mae_b = eval_forecasts_mse_mae(wrap_ma, test_loader, device)
+        mt_b, at_b = eval_channel_mse_mae(wrap_ma, test_loader, device, t_idx)
+        print_baseline_block(f"Moving-avg (w={min(24, sl)})", mse_b, mae_b, mt_b, at_b, temp_name)
+
+        dlm = fit_dlinear(train_loader, sl, pl, C, device, epochs=15, lr=1e-3)
+
+        def wrap_dl(h):
+            return dlm(h)
+
+        mse_b, mae_b = eval_forecasts_mse_mae(wrap_dl, test_loader, device)
+        mt_b, at_b = eval_channel_mse_mae(wrap_dl, test_loader, device, t_idx)
+        print_baseline_block("DLinear (train 15 ep)", mse_b, mae_b, mt_b, at_b, temp_name)
 
     hist, fut = next(iter(test_loader))
     hist = hist.to(device)
     fut = fut.to(device)
     with torch.no_grad():
-        pred = model.forecast(hist[:1])
+        fo = model.forecast(hist[:1], future=fut[:1])
     hist0 = hist[0].cpu().numpy()
     true0 = fut[0].cpu().numpy()
-    pred0 = pred[0].cpu().numpy()
+    mom0 = fo.mom[0].cpu().numpy()
+    mean0 = fo.sample_mean[0].cpu().numpy()
+    single0 = fo.single[0].cpu().numpy()
     c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
     t_hist = np.arange(cfg.seq_len)
     t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
 
-    plt.figure(figsize=(10, 4))
+    plt.figure(figsize=(11, 4))
     plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
     plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="C1")
-    plt.plot(t_fut, pred0[:, c_vis], label="forecast", color="C2", linestyle="--")
+    plt.plot(
+        t_fut,
+        mom0[:, c_vis],
+        label=f"MoM (K={cfg.forecast_num_samples}, M={cfg.mom_num_groups})",
+        color="C2",
+        linewidth=2,
+    )
+    plt.plot(
+        t_fut,
+        mean0[:, c_vis],
+        label="sample mean",
+        color="C3",
+        linestyle=":",
+        alpha=0.85,
+    )
+    plt.plot(
+        t_fut,
+        single0[:, c_vis],
+        label="1-sample",
+        color="C4",
+        linestyle="--",
+        alpha=0.75,
+    )
     plt.axvline(cfg.seq_len - 0.5, color="gray", linestyle=":")
     plt.xlabel("time step (index)")
     plt.ylabel(f"{feat_names[c_vis] if c_vis < len(feat_names) else c_vis}")
-    plt.title("SimDiff-Weather: forecast (one sample)")
+    plt.title("SimDiff-Weather: NI + MoM (temperature channel)")
     plt.legend()
     plt.tight_layout()
     plot_path = cfg.resolved_plot_dir() / "forecast_example.png"

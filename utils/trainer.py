@@ -15,7 +15,6 @@ from models.simdiff import SimDiffWeather
 
 
 def _config_to_meta(cfg: Config) -> dict:
-    """可 JSON 序列化的元数据，便于检查 checkpoint 是否由当前配置训练。"""
     meta = {
         "learning_rate": cfg.learning_rate,
         "z_clip": cfg.z_clip,
@@ -27,16 +26,20 @@ def _config_to_meta(cfg: Config) -> dict:
         "sample_clip_pred_x0": cfg.sample_clip_pred_x0,
         "training_noise_l1_weight": cfg.training_noise_l1_weight,
         "training_noise_temporal_diff_weight": cfg.training_noise_temporal_diff_weight,
-        "use_global_standardization": cfg.use_global_standardization,
-        "independent_future_normalization": cfg.independent_future_normalization,
+        "forecast_num_samples": cfg.forecast_num_samples,
+        "mom_num_groups": cfg.mom_num_groups,
         "seq_len": cfg.seq_len,
         "pred_len": cfg.pred_len,
         "input_dim": cfg.input_dim,
     }
-    if cfg.global_mean is not None:
-        meta["global_mean"] = np.asarray(cfg.global_mean, dtype=np.float64).tolist()
-    if cfg.global_std is not None:
-        meta["global_std"] = np.asarray(cfg.global_std, dtype=np.float64).tolist()
+    if cfg.train_future_marginal_mean is not None:
+        meta["train_future_marginal_mean"] = np.asarray(
+            cfg.train_future_marginal_mean, dtype=np.float64
+        ).tolist()
+    if cfg.train_future_marginal_std is not None:
+        meta["train_future_marginal_std"] = np.asarray(
+            cfg.train_future_marginal_std, dtype=np.float64
+        ).tolist()
     return meta
 
 
@@ -95,7 +98,6 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self) -> float:
-        """验证集噪声预测 MSE。"""
         self.model.eval()
         losses = []
         for hist, fut in self.val_loader:

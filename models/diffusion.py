@@ -103,16 +103,36 @@ class GaussianDiffusion(nn.Module):
         return loss
 
     @torch.no_grad()
-    def p_sample_step(self, model: nn.Module, x: torch.Tensor, t: int, hist: torch.Tensor) -> torch.Tensor:
-        """DDPM 单步反向采样（预测噪声 eps）。"""
+    def p_sample_step(
+        self,
+        model: nn.Module,
+        x: torch.Tensor,
+        t: int,
+        hist: torch.Tensor,
+        clamp_abs: float = 6.0,
+        clip_pred_x0: bool = True,
+    ) -> torch.Tensor:
+        """DDPM 单步反向采样；对 pred_x0 裁剪再算后验均值，减轻与 DDIM 类似的数值发散。"""
         b = x.shape[0]
         device = x.device
+        dtype = x.dtype
         t_b = torch.full((b,), t, device=device, dtype=torch.long)
         beta_t = self.betas[t]
         alpha_t = 1.0 - beta_t
         sqrt_one_minus_ab = self.sqrt_one_minus_alphas_cumprod[t]
+        sqrt_alpha_bar = self.sqrt_alphas_cumprod[t]
         eps_theta = model(x, t_b, hist)
-        mean = torch.rsqrt(alpha_t) * (x - beta_t / sqrt_one_minus_ab * eps_theta)
+
+        pred_x0 = (x - sqrt_one_minus_ab * eps_theta) / sqrt_alpha_bar.clamp(min=1e-8)
+        if clip_pred_x0:
+            pred_x0 = pred_x0.clamp(-clamp_abs, clamp_abs)
+
+        alpha_bar = self.alphas_cumprod[t].to(device=device, dtype=dtype)
+        alpha_bar_prev = self.alphas_cumprod_prev[t].to(device=device, dtype=dtype)
+        coef_x0 = (torch.sqrt(alpha_bar_prev) * beta_t) / (1.0 - alpha_bar).clamp(min=1e-8)
+        coef_xt = (torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev)) / (1.0 - alpha_bar).clamp(min=1e-8)
+        mean = coef_x0 * pred_x0 + coef_xt * x
+
         if t == 0:
             return mean
         noise = torch.randn_like(x)
@@ -216,7 +236,14 @@ class GaussianDiffusion(nn.Module):
 
         total = self.timesteps
         for step_i, t in enumerate(reversed(range(total))):
-            x = self.p_sample_step(model, x, t, hist)
+            x = self.p_sample_step(
+                model,
+                x,
+                t,
+                hist,
+                clamp_abs=clamp_abs,
+                clip_pred_x0=clip_pred_x0,
+            )
             x = x.clamp(-clamp_abs, clamp_abs)
             if sample_debug and (
                 step_i % max(1, sample_debug_every) == 0 or t == 0
