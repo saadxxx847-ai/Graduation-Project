@@ -12,6 +12,8 @@ from typing import Any
 class Config:
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
     data_path: str = "data/weather.csv"
+    # True：只保留气温一列（毕设单变量预测）；False：使用 CSV 全部数值列
+    temperature_only: bool = True
     processed_dir: str = "data/processed"
     checkpoint_dir: str = "checkpoints"
     plot_dir: str = "plots"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 SimDiff-Weather 主入口：默认 **先训练再评估**。
+默认仅使用气温 `T (degC)` 单变量序列；`--all_features` 可恢复多变量。
 使用 `--eval_only` 将 **跳过训练** 并加载已有权重——若从未训练，指标无意义。
 """
 from __future__ import annotations
@@ -33,7 +34,9 @@ from utils.trainer import Trainer
 
 
 def resolve_temperature_feature_index(feat_names: list[str]) -> int:
-    """优先匹配「气温」列（weather.csv 中一般为 T (degC)），用于分通道报告。"""
+    """单变量气温时恒为 0；多变量时解析气温列索引。"""
+    if len(feat_names) == 1:
+        return 0
     for key in ("T (degC)", "T(degC)", "temp", "temperature"):
         for i, name in enumerate(feat_names):
             if name.strip().lower() == key.lower():
@@ -100,6 +103,11 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument(
+        "--all_features",
+        action="store_true",
+        help="使用 weather.csv 全部数值列（默认仅气温单变量）",
+    )
+    parser.add_argument(
         "--seq_len",
         type=int,
         default=None,
@@ -159,6 +167,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = Config()
+    if args.all_features:
+        cfg.temperature_only = False
     if args.epochs is not None:
         cfg.epochs = args.epochs
     if args.batch_size is not None:
@@ -208,7 +218,8 @@ def main() -> None:
         f"训练噪声损失: MSE + L1×{cfg.training_noise_l1_weight} + "
         f"时间差分×{cfg.training_noise_temporal_diff_weight}"
     )
-    print(f"特征维度 C={n_features}, 列名示例: {feat_names[:5]}...")
+    mode = "仅气温单变量" if cfg.temperature_only else "全部气象变量"
+    print(f"特征维度 C={n_features}（{mode}）, 列: {feat_names}")
     print(
         f"Normalization Independence: 历史/未来分算 μ,σ；"
         f"无真值反变换用训练集未来边际 std范围 "
@@ -327,43 +338,19 @@ def main() -> None:
         fo = model.forecast(hist[:1], future=fut[:1])
     hist0 = hist[0].cpu().numpy()
     true0 = fut[0].cpu().numpy()
-    mom0 = fo.mom[0].cpu().numpy()
-    mean0 = fo.sample_mean[0].cpu().numpy()
-    single0 = fo.single[0].cpu().numpy()
+    pred0 = fo.mom[0].cpu().numpy()
     c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
     t_hist = np.arange(cfg.seq_len)
     t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
 
-    plt.figure(figsize=(11, 4))
+    plt.figure(figsize=(10, 4))
     plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
     plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="C1")
-    plt.plot(
-        t_fut,
-        mom0[:, c_vis],
-        label=f"MoM (K={cfg.forecast_num_samples}, M={cfg.mom_num_groups})",
-        color="C2",
-        linewidth=2,
-    )
-    plt.plot(
-        t_fut,
-        mean0[:, c_vis],
-        label="sample mean",
-        color="C3",
-        linestyle=":",
-        alpha=0.85,
-    )
-    plt.plot(
-        t_fut,
-        single0[:, c_vis],
-        label="1-sample",
-        color="C4",
-        linestyle="--",
-        alpha=0.75,
-    )
+    plt.plot(t_fut, pred0[:, c_vis], label="forecast", color="C2", linestyle="--")
     plt.axvline(cfg.seq_len - 0.5, color="gray", linestyle=":")
     plt.xlabel("time step (index)")
     plt.ylabel(f"{feat_names[c_vis] if c_vis < len(feat_names) else c_vis}")
-    plt.title("SimDiff-Weather: NI + MoM (temperature channel)")
+    plt.title("SimDiff-Weather: forecast")
     plt.legend()
     plt.tight_layout()
     plot_path = cfg.resolved_plot_dir() / "forecast_example.png"

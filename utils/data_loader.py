@@ -13,6 +13,21 @@ from torch.utils.data import DataLoader, Dataset
 from config.config import Config
 
 
+def resolve_temperature_column_name(feature_names: list[str]) -> str:
+    """在 weather表头中定位气温列名（与 main 中逻辑一致）。"""
+    for key in ("T (degC)", "T(degC)", "temp", "temperature"):
+        for name in feature_names:
+            if name.strip().lower() == key.lower():
+                return name
+    for name in feature_names:
+        n = name.lower()
+        if "degc" in n and "tlog" not in n and "tpot" not in n and n.strip().startswith("t"):
+            return name
+    raise ValueError(
+        f"未找到气温列（期望如 T (degC)）。当前列: {feature_names[:15]}..."
+    )
+
+
 class WeatherWindowDataset(Dataset):
     def __init__(self, data: np.ndarray, seq_len: int, pred_len: int):
         """
@@ -80,6 +95,11 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
         raise FileNotFoundError(f"未找到数据文件: {path}")
 
     matrix, names = load_weather_matrix(path)
+    if getattr(cfg, "temperature_only", True):
+        tcol = resolve_temperature_column_name(names)
+        ti = names.index(tcol)
+        matrix = matrix[:, ti : ti + 1]
+        names = [names[ti]]
     T, C = matrix.shape
     cfg.input_dim = C
 
