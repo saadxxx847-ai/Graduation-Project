@@ -355,7 +355,7 @@ def main() -> None:
 
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_persist, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_persist, test_loader, device, t_idx)
-        print_baseline_block("Persistence", mse_b, mae_b, mt_b, at_b, temp_name)
+        print_baseline_block("Persistence", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
         horizon_maes["Persistence"] = eval_horizon_mae(
             lambda h, f: persistence_forecast(h, pl),
             test_loader,
@@ -370,7 +370,9 @@ def main() -> None:
 
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_ma, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_ma, test_loader, device, t_idx)
-        print_baseline_block(f"Moving-avg (w={min(24, sl)})", mse_b, mae_b, mt_b, at_b, temp_name)
+        print_baseline_block(
+            f"Moving-avg (w={min(24, sl)})", mse_b, mae_b, mt_b, at_b, temp_name, n_features
+        )
         horizon_maes[f"MA(w={min(24, sl)})"] = eval_horizon_mae(
             lambda h, f: moving_average_forecast(h, pl, window=min(24, sl)),
             test_loader,
@@ -399,7 +401,7 @@ def main() -> None:
 
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_dl, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_dl, test_loader, device, t_idx)
-        print_baseline_block("DLinear", mse_b, mae_b, mt_b, at_b, temp_name)
+        print_baseline_block("DLinear", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
         horizon_maes["DLinear"] = eval_horizon_mae(
             lambda h, f: dlm(h),
             test_loader,
@@ -430,7 +432,7 @@ def main() -> None:
 
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_lstm, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_lstm, test_loader, device, t_idx)
-        print_baseline_block("LSTM", mse_b, mae_b, mt_b, at_b, temp_name)
+        print_baseline_block("LSTM", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
         horizon_maes["LSTM"] = eval_horizon_mae(
             lambda h, f: lstm_m(h),
             test_loader,
@@ -469,7 +471,9 @@ def main() -> None:
 
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_tr, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_tr, test_loader, device, t_idx)
-        print_baseline_block("Plain Transformer", mse_b, mae_b, mt_b, at_b, temp_name)
+        print_baseline_block(
+            "Plain Transformer", mse_b, mae_b, mt_b, at_b, temp_name, n_features
+        )
         horizon_maes["Plain Transformer"] = eval_horizon_mae(
             lambda h, f: trans_m(h),
             test_loader,
