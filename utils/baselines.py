@@ -330,8 +330,8 @@ def print_baseline_block(
 ) -> None:
     if num_channels <= 1:
         print(f"  [{name}] {temp_name} MSE={mse_t:.6f} MAE={mae_t:.6f}")
- return
-    print(
-        f"  [{name}] 全特征平均 MSE={mse_all:.6f} MAE={mae_all:.6f} | "
-        f"{temp_name} MSE={mse_t:.6f} MAE={mae_t:.6f}"
-    )
+    else:
+        print(
+            f"  [{name}] 全特征平均 MSE={mse_all:.6f} MAE={mae_all:.6f} | "
+            f"{temp_name} MSE={mse_t:.6f} MAE={mae_t:.6f}"
+        )
