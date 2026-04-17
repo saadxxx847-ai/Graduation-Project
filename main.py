@@ -22,12 +22,24 @@ if str(ROOT) not in sys.path:
 from config.config import Config
 from models.simdiff import SimDiffWeather
 from utils.baselines import (
+    BaselineLSTM,
+    BaselineTransformer,
+    DLinearMap,
+    collect_pooled_predictions,
     eval_channel_mse_mae,
     eval_forecasts_mse_mae,
-    fit_dlinear,
+    eval_horizon_mae,
+    fit_regression_model,
     moving_average_forecast,
     persistence_forecast,
     print_baseline_block,
+)
+from utils.compare_viz import (
+    plot_forecast_compare,
+    plot_forecast_grid,
+    plot_horizon_mae,
+    plot_metrics_bars,
+    plot_pred_vs_true_scatter,
 )
 from utils.data_loader import make_loaders
 from utils.trainer import Trainer
@@ -288,21 +300,48 @@ def main() -> None:
         mae_s = torch.mean(torch.abs(pred_m - fut))
     t_idx = resolve_temperature_feature_index(feat_names)
     temp_name = feat_names[t_idx] if t_idx < len(feat_names) else str(t_idx)
-    print(
-        f"采样评估（单 batch，MoM：K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}）\n"
+    _lines = [
+        f"采样评估（单 batch，MoM：K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}）",
         f"  主变量 [{temp_name}] MSE: {torch.mean((pred_m[..., t_idx] - fut[..., t_idx]) ** 2).item():.6f} | "
-        f"MAE: {torch.mean(torch.abs(pred_m[..., t_idx] - fut[..., t_idx])).item():.6f}\n"
-        f"  全特征平均 MSE: {mse_s.item():.6f} | MAE: {mae_s.item():.6f}（辅助）"
-    )
+        f"MAE: {torch.mean(torch.abs(pred_m[..., t_idx] - fut[..., t_idx])).item():.6f}",
+    ]
+    if n_features > 1:
+        _lines.append(
+            f"  全特征平均 MSE: {mse_s.item():.6f} | MAE: {mae_s.item():.6f}（辅助）"
+        )
+    print("\n".join(_lines))
     mse_test, mae_test, mae_ch, mse_ch = evaluate_test_loader(
         model, test_loader, device, n_features
     )
     print(
         f"\n【主结论 · 温度】{temp_name} — 全测试集 MSE: {mse_ch[t_idx]:.6f} | MAE: {mae_ch[t_idx]:.6f}"
     )
-    print(
-        f"【辅助】全特征平均 MSE: {mse_test:.6f} | MAE: {mae_test:.6f}"
-    )
+    if n_features > 1:
+        print(f"【辅助】全特征平均 MSE: {mse_test:.6f} | MAE: {mae_test:.6f}")
+
+    plot_dir = cfg.resolved_plot_dir()
+    c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
+    ylabel = feat_names[c_vis] if c_vis < len(feat_names) else str(c_vis)
+    t_hist = np.arange(cfg.seq_len)
+    t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
+
+    horizon_maes: dict[str, np.ndarray] = {
+        "SimDiff": eval_horizon_mae(
+            lambda h, f: model.forecast(h, future=f).mom,
+            test_loader,
+            device,
+            cfg.pred_len,
+            t_idx,
+            n_features,
+        )
+    }
+    bar_names: list[str] = ["SimDiff"]
+    bar_maes: list[float] = [float(mae_ch[t_idx])]
+    bar_mses: list[float] = [float(mse_ch[t_idx])]
+
+    dlm: DLinearMap | None = None
+    lstm_m: BaselineLSTM | None = None
+    trans_m: BaselineTransformer | None = None
 
     if not args.skip_baselines:
         print("\n--- 基线（原始尺度，全测试集）---")
@@ -317,19 +356,212 @@ def main() -> None:
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_persist, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_persist, test_loader, device, t_idx)
         print_baseline_block("Persistence", mse_b, mae_b, mt_b, at_b, temp_name)
+        horizon_maes["Persistence"] = eval_horizon_mae(
+            lambda h, f: persistence_forecast(h, pl),
+            test_loader,
+            device,
+            cfg.pred_len,
+            t_idx,
+            n_features,
+        )
+        bar_names.append("Persistence")
+        bar_maes.append(float(at_b))
+        bar_mses.append(float(mt_b))
 
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_ma, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_ma, test_loader, device, t_idx)
         print_baseline_block(f"Moving-avg (w={min(24, sl)})", mse_b, mae_b, mt_b, at_b, temp_name)
+        horizon_maes[f"MA(w={min(24, sl)})"] = eval_horizon_mae(
+            lambda h, f: moving_average_forecast(h, pl, window=min(24, sl)),
+            test_loader,
+            device,
+            cfg.pred_len,
+            t_idx,
+            n_features,
+        )
 
-        dlm = fit_dlinear(train_loader, sl, pl, C, device, epochs=15, lr=1e-3)
+        print("\n--- 学习型基线（验证集 MSE 早停，与 SimDiff 同 epoch 上限）---")
+        dlm = DLinearMap(sl, pl, C)
+        dlm = fit_regression_model(
+            dlm,
+            train_loader,
+            val_loader,
+            device,
+            max_epochs=cfg.baseline_max_epochs,
+            lr=cfg.baseline_lr,
+            patience=cfg.baseline_early_stop_patience,
+            grad_clip_max_norm=cfg.baseline_grad_clip_max_norm,
+            name="DLinear",
+        )
 
         def wrap_dl(h):
             return dlm(h)
 
         mse_b, mae_b = eval_forecasts_mse_mae(wrap_dl, test_loader, device)
         mt_b, at_b = eval_channel_mse_mae(wrap_dl, test_loader, device, t_idx)
-        print_baseline_block("DLinear (train 15 ep)", mse_b, mae_b, mt_b, at_b, temp_name)
+        print_baseline_block("DLinear", mse_b, mae_b, mt_b, at_b, temp_name)
+        horizon_maes["DLinear"] = eval_horizon_mae(
+            lambda h, f: dlm(h),
+            test_loader,
+            device,
+            cfg.pred_len,
+            t_idx,
+            n_features,
+        )
+        bar_names.append("DLinear")
+        bar_maes.append(float(at_b))
+        bar_mses.append(float(mt_b))
+
+        lstm_m = BaselineLSTM(C, pl, cfg.baseline_lstm_hidden, cfg.baseline_lstm_layers, cfg.dropout)
+        lstm_m = fit_regression_model(
+            lstm_m,
+            train_loader,
+            val_loader,
+            device,
+            max_epochs=cfg.baseline_max_epochs,
+            lr=cfg.baseline_lr,
+            patience=cfg.baseline_early_stop_patience,
+            grad_clip_max_norm=cfg.baseline_grad_clip_max_norm,
+            name="LSTM",
+        )
+
+        def wrap_lstm(h):
+            return lstm_m(h)
+
+        mse_b, mae_b = eval_forecasts_mse_mae(wrap_lstm, test_loader, device)
+        mt_b, at_b = eval_channel_mse_mae(wrap_lstm, test_loader, device, t_idx)
+        print_baseline_block("LSTM", mse_b, mae_b, mt_b, at_b, temp_name)
+        horizon_maes["LSTM"] = eval_horizon_mae(
+            lambda h, f: lstm_m(h),
+            test_loader,
+            device,
+            cfg.pred_len,
+            t_idx,
+            n_features,
+        )
+        bar_names.append("LSTM")
+        bar_maes.append(float(at_b))
+        bar_mses.append(float(mt_b))
+
+        trans_m = BaselineTransformer(
+            sl,
+            pl,
+            C,
+            d_model=cfg.baseline_transformer_d_model,
+            nhead=cfg.baseline_transformer_nhead,
+            num_layers=cfg.baseline_transformer_layers,
+            dropout=cfg.dropout,
+        )
+        trans_m = fit_regression_model(
+            trans_m,
+            train_loader,
+            val_loader,
+            device,
+            max_epochs=cfg.baseline_max_epochs,
+            lr=cfg.baseline_lr,
+            patience=cfg.baseline_early_stop_patience,
+            grad_clip_max_norm=cfg.baseline_grad_clip_max_norm,
+            name="Plain Transformer",
+        )
+
+        def wrap_tr(h):
+            return trans_m(h)
+
+        mse_b, mae_b = eval_forecasts_mse_mae(wrap_tr, test_loader, device)
+        mt_b, at_b = eval_channel_mse_mae(wrap_tr, test_loader, device, t_idx)
+        print_baseline_block("Plain Transformer", mse_b, mae_b, mt_b, at_b, temp_name)
+        horizon_maes["Plain Transformer"] = eval_horizon_mae(
+            lambda h, f: trans_m(h),
+            test_loader,
+            device,
+            cfg.pred_len,
+            t_idx,
+            n_features,
+        )
+        bar_names.append("Plain Transformer")
+        bar_maes.append(float(at_b))
+        bar_mses.append(float(mt_b))
+
+        yt, yp = collect_pooled_predictions(
+            lambda h, f: model.forecast(h, future=f).mom,
+            test_loader,
+            device,
+            t_idx,
+        )
+        p_sc = plot_dir / "scatter_simdiff_pred_vs_true.png"
+        plot_pred_vs_true_scatter(
+            p_sc,
+            yt,
+            yp,
+            title=f"SimDiff: predicted vs true ({temp_name})",
+        )
+        print(f"Saved plot: {p_sc}")
+
+        hist_b, fut_b = next(iter(test_loader))
+        hist_b = hist_b.to(device)
+        fut_b = fut_b.to(device)
+        with torch.no_grad():
+            preds_np: dict[str, np.ndarray] = {
+                "SimDiff": model.forecast(hist_b, future=fut_b).mom.cpu().numpy(),
+                "DLinear": dlm(hist_b).cpu().numpy(),
+                "LSTM": lstm_m(hist_b).cpu().numpy(),
+                "Plain Transformer": trans_m(hist_b).cpu().numpy(),
+            }
+        hist0 = hist_b[0].cpu().numpy()
+        true0 = fut_b[0].cpu().numpy()
+        pred_dict = {k: v[0] for k, v in preds_np.items()}
+        p_cmp = plot_dir / "forecast_compare_example.png"
+        plot_forecast_compare(
+            p_cmp,
+            t_hist,
+            t_fut,
+            hist0,
+            true0,
+            pred_dict,
+            ylabel=ylabel,
+            title=f"Forecast comparison (first test batch sample) — {temp_name}",
+        )
+        print(f"Saved plot: {p_cmp}")
+
+        n_ex = min(4, hist_b.shape[0])
+        grid_ex = []
+        for i in range(n_ex):
+            grid_ex.append(
+                {
+                    "hist": hist_b[i].cpu().numpy(),
+                    "true": fut_b[i].cpu().numpy(),
+                    "preds": {k: preds_np[k][i] for k in preds_np},
+                }
+            )
+        p_grid = plot_dir / "forecast_compare_grid.png"
+        plot_forecast_grid(
+            p_grid,
+            grid_ex,
+            cfg.seq_len,
+            cfg.pred_len,
+            ylabel=ylabel,
+            title=f"Forecast comparison — {temp_name}",
+        )
+        print(f"Saved plot: {p_grid}")
+
+    p_metrics = plot_dir / "metrics_comparison_mae_mse.png"
+    plot_metrics_bars(
+        p_metrics,
+        bar_names,
+        bar_maes,
+        bar_mses,
+        title=f"Test metrics — {temp_name}",
+    )
+    print(f"Saved plot: {p_metrics}")
+
+    p_h = plot_dir / "mae_by_horizon.png"
+    plot_horizon_mae(
+        p_h,
+        horizon_maes,
+        cfg.pred_len,
+        title=f"MAE by horizon — {temp_name}",
+    )
+    print(f"Saved plot: {p_h}")
 
     hist, fut = next(iter(test_loader))
     hist = hist.to(device)
@@ -339,21 +571,18 @@ def main() -> None:
     hist0 = hist[0].cpu().numpy()
     true0 = fut[0].cpu().numpy()
     pred0 = fo.mom[0].cpu().numpy()
-    c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
-    t_hist = np.arange(cfg.seq_len)
-    t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
 
     plt.figure(figsize=(10, 4))
     plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
     plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="C1")
-    plt.plot(t_fut, pred0[:, c_vis], label="forecast", color="C2", linestyle="--")
+    plt.plot(t_fut, pred0[:, c_vis], label="SimDiff (MoM)", color="C2", linestyle="--")
     plt.axvline(cfg.seq_len - 0.5, color="gray", linestyle=":")
     plt.xlabel("time step (index)")
-    plt.ylabel(f"{feat_names[c_vis] if c_vis < len(feat_names) else c_vis}")
-    plt.title("SimDiff-Weather: forecast")
+    plt.ylabel(ylabel)
+    plt.title("SimDiff-Weather: forecast (single model)")
     plt.legend()
     plt.tight_layout()
-    plot_path = cfg.resolved_plot_dir() / "forecast_example.png"
+    plot_path = plot_dir / "forecast_example.png"
     plt.savefig(plot_path, dpi=150)
     plt.close()
     print(f"Saved plot: {plot_path}")

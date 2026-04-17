@@ -53,6 +53,17 @@ class Config:
 
     device: str = "cuda"
 
+    # DLinear / LSTM / Plain Transformer：与 SimDiff 同数据划分，在验证集 MSE 上早停
+    baseline_max_epochs: int = 50
+    baseline_early_stop_patience: int = 10
+    baseline_lr: float = 1e-3
+    baseline_grad_clip_max_norm: float = 1.0
+    baseline_transformer_d_model: int = 128
+    baseline_transformer_nhead: int = 4
+    baseline_transformer_layers: int = 3
+    baseline_lstm_hidden: int = 128
+    baseline_lstm_layers: int = 2
+
     # MoM：K 次独立采样 → 分 M 组组内均值 → M 个均值再逐元中位数
     forecast_num_samples: int = 20
     mom_num_groups: int = 5
