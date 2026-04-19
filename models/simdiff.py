@@ -17,13 +17,21 @@ from models.network import DenoiserTransformer
 from utils.independent_normalizer import IndependentNormalizer, mom_aggregate_normalized
 
 
+def point_prediction_from_forecast(out: ForecastOutput, cfg: Config) -> torch.Tensor:
+    """根据消融配置选择点预测：ni_only 用 K 次采样算术均值；full / mom_only 用 MoM。"""
+    if cfg.simdiff_ablation == "ni_only":
+        return out.sample_mean
+    return out.mom
+
+
 @dataclass
 class ForecastOutput:
-    """单次采样、K 次均值、MoM 三种点预测（原始尺度）。"""
+    """单次采样、K 次均值、MoM 三种点预测（原始尺度）；可选 K 条轨迹供 CRPS / 区间图。"""
 
     single: torch.Tensor
     sample_mean: torch.Tensor
     mom: torch.Tensor
+    samples: torch.Tensor | None = None
 
 
 class SimDiffWeather(nn.Module):
@@ -32,6 +40,7 @@ class SimDiffWeather(nn.Module):
         if cfg.input_dim <= 0:
             raise ValueError("请先加载数据并设置 cfg.input_dim")
         cfg.validate_mom_config()
+        cfg.validate_simdiff_ablation()
         if cfg.train_future_marginal_mean is None or cfg.train_future_marginal_std is None:
             raise ValueError("请先运行 make_loaders 以写入 train_future_marginal_mean/std")
 
@@ -78,9 +87,13 @@ class SimDiffWeather(nn.Module):
             IndependentNormalizer.debug_assert_shapes_and_idempotent_history(
                 hist, future, self.cfg.seq_len, self.cfg.pred_len
             )
-        hist_n, _ = IndependentNormalizer.normalize_history(hist)
-        fut_n, _ = IndependentNormalizer.normalize_future(future)
+        hist_n, st_h = IndependentNormalizer.normalize_history(hist)
         hist_n = self._clip_z(hist_n)
+        if self.cfg.simdiff_ablation == "mom_only":
+            mu_h, sig_h = st_h["mu_h"], st_h["sig_h"]
+            fut_n = (future - mu_h) / sig_h
+        else:
+            fut_n, _ = IndependentNormalizer.normalize_future(future)
         fut_n = self._clip_z(fut_n)
         b = hist.shape[0]
         device = hist.device
@@ -123,16 +136,62 @@ class SimDiffWeather(nn.Module):
         return stacked
 
     @torch.no_grad()
+    def get_denoise_trajectory_physical(
+        self,
+        hist: torch.Tensor,
+        future: torch.Tensor | None,
+        max_points: int | None = None,
+    ) -> list[np.ndarray]:
+        """
+        单条反向扩散链在原始尺度的快照 [ (Lf, C), ... ]；使用 hist的第 0 条样本。
+         评估时传入 future[:1] 以便与 forecast 一致地做 NI 反变换。
+        """
+        mp = int(max_points if max_points is not None else self.cfg.denoise_trajectory_max_points)
+        device = hist.device
+        b0 = hist[:1]
+        hist_n, st_h = IndependentNormalizer.normalize_history(b0)
+        hist_n = self._clip_z(hist_n)
+        _out = self.diffusion.sample(
+            self.net,
+            hist_n,
+            self.cfg.pred_len,
+            self.cfg.input_dim,
+            device,
+            clamp_abs=self._sample_clamp_abs,
+            sampling_mode=self.cfg.sampling_mode,
+            sampling_steps=self.cfg.sampling_steps,
+            ddim_eta=float(self.cfg.ddim_eta),
+            clip_pred_x0=bool(self.cfg.sample_clip_pred_x0),
+            sample_debug=False,
+            sample_debug_every=int(self.cfg.sample_debug_every),
+            return_trajectory=True,
+            trajectory_max_points=mp,
+        )
+        _, traj_norm = _out
+        if self.cfg.simdiff_ablation == "mom_only":
+            mu_inv, sig_inv = st_h["mu_h"], st_h["sig_h"]
+        else:
+            fut0 = future[:1] if future is not None else None
+            mu_inv, sig_inv = self._future_mu_sig_for_inverse(fut0, 1, device)
+        phys: list[np.ndarray] = []
+        for tn in traj_norm:
+            x = IndependentNormalizer.inverse_transform_future(tn, mu_inv, sig_inv)
+            phys.append(x[0].detach().cpu().numpy())
+        return phys
+
+    @torch.no_grad()
     def forecast(
         self,
         hist: torch.Tensor,
         future: torch.Tensor | None = None,
         num_samples: int | None = None,
         num_groups: int | None = None,
+        return_samples: bool = False,
     ) -> ForecastOutput:
         """
         推理：K 次采样 → MoM（M 组组均值的中位数）+ 单次与全均值。
         future 可选；评估时传入真值以便用本窗 μ_f,σ_f 反变换（模型仍只消费 hist）。
+        return_samples=True 时额外返回 samples (B,K,Lf,C) 原始尺度，用于 CRPS / 预测区间。
         """
         device = hist.device
         b = hist.shape[0]
@@ -143,17 +202,34 @@ class SimDiffWeather(nn.Module):
         elif k % m != 0:
             raise ValueError(f"K={k} 必须能被 M={m} 整除")
 
-        hist_n, _ = IndependentNormalizer.normalize_history(hist)
+        hist_n, st_h = IndependentNormalizer.normalize_history(hist)
         hist_n = self._clip_z(hist_n)
 
         stacked = self._sample_k_trajectories_norm(hist_n, k)
         single_n, mean_n, mom_n = mom_aggregate_normalized(stacked, m)
 
-        mu_f, sig_f = self._future_mu_sig_for_inverse(future, b, device)
-        single = IndependentNormalizer.inverse_transform_future(single_n, mu_f, sig_f)
-        sample_mean = IndependentNormalizer.inverse_transform_future(mean_n, mu_f, sig_f)
-        mom = IndependentNormalizer.inverse_transform_future(mom_n, mu_f, sig_f)
-        return ForecastOutput(single=single, sample_mean=sample_mean, mom=mom)
+        if self.cfg.simdiff_ablation == "mom_only":
+            mu_inv, sig_inv = st_h["mu_h"], st_h["sig_h"]
+        else:
+            mu_inv, sig_inv = self._future_mu_sig_for_inverse(future, b, device)
+        single = IndependentNormalizer.inverse_transform_future(single_n, mu_inv, sig_inv)
+        sample_mean = IndependentNormalizer.inverse_transform_future(mean_n, mu_inv, sig_inv)
+        mom = IndependentNormalizer.inverse_transform_future(mom_n, mu_inv, sig_inv)
+
+        samples_phys: torch.Tensor | None = None
+        if return_samples:
+            bk = b * k
+            _, _, lf, c = stacked.shape
+            sk = stacked.reshape(bk, lf, c)
+            mu_bk = mu_inv.repeat_interleave(k, dim=0)
+            sig_bk = sig_inv.repeat_interleave(k, dim=0)
+            samples_phys = IndependentNormalizer.inverse_transform_future(
+                sk, mu_bk, sig_bk
+            ).reshape(b, k, lf, c)
+
+        return ForecastOutput(
+            single=single, sample_mean=sample_mean, mom=mom, samples=samples_phys
+        )
 
     @torch.no_grad()
     def validation_mse(
@@ -162,6 +238,7 @@ class SimDiffWeather(nn.Module):
         future: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out = self.forecast(hist, future=future)
-        mse = torch.mean((out.mom - future) ** 2)
-        mae = torch.mean(torch.abs(out.mom - future))
+        pred = point_prediction_from_forecast(out, self.cfg)
+        mse = torch.mean((pred - future) ** 2)
+        mae = torch.mean(torch.abs(pred - future))
         return mse, mae

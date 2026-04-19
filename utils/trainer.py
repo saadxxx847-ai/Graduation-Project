@@ -28,6 +28,7 @@ def _config_to_meta(cfg: Config) -> dict:
         "training_noise_temporal_diff_weight": cfg.training_noise_temporal_diff_weight,
         "forecast_num_samples": cfg.forecast_num_samples,
         "mom_num_groups": cfg.mom_num_groups,
+        "simdiff_ablation": cfg.simdiff_ablation,
         "temperature_only": cfg.temperature_only,
         "seq_len": cfg.seq_len,
         "pred_len": cfg.pred_len,
@@ -73,6 +74,8 @@ class Trainer:
         )
         self.best_val = float("inf")
         self.bad_epochs = 0
+        self.history_train: list[float] = []
+        self.history_val: list[float] = []
 
     def train_epoch(self) -> float:
         self.model.train()
@@ -124,9 +127,10 @@ class Trainer:
 
     def fit(self) -> None:
         ckpt_dir = self.cfg.resolved_checkpoint_dir()
-        best_path = ckpt_dir / "simdiff_weather_best.pt"
+        best_path = ckpt_dir / self.cfg.simdiff_checkpoint_filename()
 
         print("=== 训练模式：将更新模型权重；请勿使用 --eval_only 跳过训练 ===")
+        print(f"=== 权重将保存为: {best_path.name} (ablation={self.cfg.simdiff_ablation}) ===")
 
         for epoch in range(1, self.cfg.epochs + 1):
             tr = self.train_epoch()
@@ -136,6 +140,8 @@ class Trainer:
             print(
                 f"Epoch {epoch:03d} | train_loss {tr:.6f} | val_mse {va:.6f} | lr {lr_now:.2e}"
             )
+            self.history_train.append(tr)
+            self.history_val.append(float(va) if np.isfinite(va) else float("nan"))
             if not np.isfinite(va):
                 print("  [warn] val 非有限，请检查数据。")
                 continue

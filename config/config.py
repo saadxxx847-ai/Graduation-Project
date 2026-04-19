@@ -38,6 +38,8 @@ class Config:
     sample_clip_pred_x0: bool = True
     sample_debug: bool = False
     sample_debug_every: int = 20
+    # 去噪轨迹图：沿反向过程均匀保留的帧数（含初始纯噪声）
+    denoise_trajectory_max_points: int = 36
 
     training_noise_l1_weight: float = 0.08
     training_noise_temporal_diff_weight: float = 0.05
@@ -67,6 +69,10 @@ class Config:
     # MoM：K 次独立采样 → 分 M 组组内均值 → M 个均值再逐元中位数
     forecast_num_samples: int = 20
     mom_num_groups: int = 5
+
+    # SimDiff 消融：full=NI+MoM；ni_only=保留 NI，评估用 K 次算术均值（无 MoM），与 full 共用权重；
+    # mom_only=未来用历史窗 μ_h,σ_h 归一化（非 NI）+ MoM，需单独训练，见 simdiff_checkpoint_filename()
+    simdiff_ablation: str = "full"
 
     # 训练集「仅未来窗口」聚合的边际 μ/σ，供无真值时反归一化（make_loaders 写入）
     train_future_marginal_mean: Any = field(default=None, repr=False)
@@ -99,6 +105,16 @@ class Config:
         p = self.project_root / self.plot_dir
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    def simdiff_checkpoint_filename(self) -> str:
+        if self.simdiff_ablation == "mom_only":
+            return "simdiff_weather_best_mom_only.pt"
+        return "simdiff_weather_best.pt"
+
+    def validate_simdiff_ablation(self) -> None:
+        allowed = ("full", "ni_only", "mom_only")
+        if self.simdiff_ablation not in allowed:
+            raise ValueError(f"simdiff_ablation 须为 {allowed}，当前为 {self.simdiff_ablation!r}")
 
     def validate_mom_config(self) -> None:
         k, m = int(self.forecast_num_samples), int(self.mom_num_groups)

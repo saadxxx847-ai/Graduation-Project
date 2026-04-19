@@ -11,6 +11,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _trajectory_save_indices(n_inner_steps: int, max_points: int) -> set[int]:
+    """在0..n_inner_steps-1 内均匀取点，记录「完成该步反向更新后」的 x。"""
+    if n_inner_steps <= 0:
+        return set()
+    m = min(max(max_points, 2) - 1, n_inner_steps)
+    idx = np.linspace(0, n_inner_steps - 1, m, dtype=np.int64)
+    return set(int(x) for x in idx.tolist())
+
+
 def build_ddim_time_pairs(t_total: int, sampling_steps: int | None) -> list[tuple[int, int]]:
     """
     构造 DDIM 的 (t, t_prev) 序列，保证时间严格递减、终点为 0。
@@ -205,18 +214,30 @@ class GaussianDiffusion(nn.Module):
         clip_pred_x0: bool = True,
         sample_debug: bool = False,
         sample_debug_every: int = 20,
-    ) -> torch.Tensor:
-        """从纯高斯噪声反向采样得到归一化空间中的未来序列；末尾 clamp 与训练时 z_clip 同量级，减轻未收敛时的爆炸。"""
+        return_trajectory: bool = False,
+        trajectory_max_points: int = 36,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """从纯高斯噪声反向采样得到归一化空间中的未来序列；末尾 clamp 与训练时 z_clip 同量级，减轻未收敛时的爆炸。
+        return_trajectory=True 时返回 (x_final, traj)，traj[0] 为初始噪声，其后为沿反向过程子采样快照（同 x 形状）。"""
         b = hist.shape[0]
         x = torch.randn(b, pred_len, channels, device=device)
         model.eval()
         mode = (sampling_mode or "ddpm").lower()
+        trajectory: list[torch.Tensor] = []
+        if return_trajectory:
+            trajectory.append(x.detach().clone())
         if sample_debug:
             self._log_sample_tensor("init noise x_T", x)
 
         if mode == "ddim":
             t_total = self.timesteps
             pairs = build_ddim_time_pairs(t_total, sampling_steps)
+            n_pairs = len(pairs)
+            save_idx = (
+                _trajectory_save_indices(n_pairs, trajectory_max_points)
+                if return_trajectory
+                else set()
+            )
             for i, (t, t_prev) in enumerate(pairs):
                 x = self._ddim_step(
                     model,
@@ -232,9 +253,21 @@ class GaussianDiffusion(nn.Module):
                     i % max(1, sample_debug_every) == 0 or i == len(pairs) - 1
                 ):
                     self._log_sample_tensor(f"ddim {i+1}/{len(pairs)} t={t}->{t_prev} x", x)
-            return x.clamp(-clamp_abs, clamp_abs)
+                if return_trajectory and i in save_idx:
+                    trajectory.append(x.detach().clone())
+            x = x.clamp(-clamp_abs, clamp_abs)
+            if return_trajectory:
+                if len(trajectory) == 0 or not torch.allclose(trajectory[-1], x, atol=1e-5, rtol=1e-4):
+                    trajectory.append(x.detach().clone())
+                return x, trajectory
+            return x
 
         total = self.timesteps
+        save_idx = (
+            _trajectory_save_indices(total, trajectory_max_points)
+            if return_trajectory
+            else set()
+        )
         for step_i, t in enumerate(reversed(range(total))):
             x = self.p_sample_step(
                 model,
@@ -249,4 +282,11 @@ class GaussianDiffusion(nn.Module):
                 step_i % max(1, sample_debug_every) == 0 or t == 0
             ):
                 self._log_sample_tensor(f"ddpm t={t} x", x)
-        return x.clamp(-clamp_abs, clamp_abs)
+            if return_trajectory and step_i in save_idx:
+                trajectory.append(x.detach().clone())
+        x = x.clamp(-clamp_abs, clamp_abs)
+        if return_trajectory:
+            if len(trajectory) == 0 or not torch.allclose(trajectory[-1], x, atol=1e-5, rtol=1e-4):
+                trajectory.append(x.detach().clone())
+            return x, trajectory
+        return x

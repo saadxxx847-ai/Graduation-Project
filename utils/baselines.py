@@ -301,6 +301,24 @@ def eval_horizon_mae(
 
 
 @torch.no_grad()
+def collect_channel_residuals(
+    predict_fn,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    channel: int,
+) -> np.ndarray:
+    """predict_fn(hist)->(B,Lf,C)，与真值同通道求 pred-true，展平为1D。"""
+    parts: list[np.ndarray] = []
+    for hist, fut in test_loader:
+        hist = hist.to(device)
+        fut = fut.to(device)
+        pred = predict_fn(hist)
+        d = (pred[..., channel] - fut[..., channel]).reshape(-1).detach().cpu().numpy()
+        parts.append(d)
+    return np.concatenate(parts)
+
+
+@torch.no_grad()
 def collect_pooled_predictions(
     forward: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     test_loader: torch.utils.data.DataLoader,

@@ -20,11 +20,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.config import Config
-from models.simdiff import SimDiffWeather
+from models.simdiff import SimDiffWeather, point_prediction_from_forecast
 from utils.baselines import (
     BaselineLSTM,
     BaselineTransformer,
     DLinearMap,
+    collect_channel_residuals,
     collect_pooled_predictions,
     eval_channel_mse_mae,
     eval_forecasts_mse_mae,
@@ -35,14 +36,42 @@ from utils.baselines import (
     print_baseline_block,
 )
 from utils.compare_viz import (
+    plot_crps_by_horizon,
+    plot_denoise_trajectory_heatmap,
+    plot_error_kde,
     plot_forecast_compare,
     plot_forecast_grid,
+    plot_forecast_predictive_intervals,
     plot_horizon_mae,
     plot_metrics_bars,
     plot_pred_vs_true_scatter,
+    plot_residual_kde_multi,
+    plot_training_curves,
 )
+from utils.prob_metrics import empirical_interval_coverage, eval_crps_on_test
 from utils.data_loader import make_loaders
 from utils.trainer import Trainer
+
+
+@torch.no_grad()
+def collect_test_forecast_errors(
+    model: SimDiffWeather,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    channel: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """全测试集展平：残差 pred-true、绝对误差（与点预测一致）。"""
+    parts_r: list[np.ndarray] = []
+    parts_a: list[np.ndarray] = []
+    for hist, fut in test_loader:
+        hist = hist.to(device)
+        fut = fut.to(device)
+        out = model.forecast(hist, future=fut)
+        pred = point_prediction_from_forecast(out, model.cfg)
+        d = pred[..., channel] - fut[..., channel]
+        parts_r.append(d.reshape(-1).detach().cpu().numpy())
+        parts_a.append(d.abs().reshape(-1).detach().cpu().numpy())
+    return np.concatenate(parts_r), np.concatenate(parts_a)
 
 
 def resolve_temperature_feature_index(feat_names: list[str]) -> int:
@@ -78,7 +107,7 @@ def evaluate_test_loader(
         hist = hist.to(device)
         fut = fut.to(device)
         out = model.forecast(hist, future=fut)
-        pred = out.mom
+        pred = point_prediction_from_forecast(out, model.cfg)
         diff = pred - fut
         sum_sq += float((diff**2).sum().item())
         sum_abs += float(diff.abs().sum().item())
@@ -91,6 +120,15 @@ def evaluate_test_loader(
     mse_ch = (sum_sq_ch / max(steps, 1)).cpu().numpy()
     mae_ch = (sum_abs_ch / max(steps, 1)).cpu().numpy()
     return mse_all, mae_all, mae_ch, mse_ch
+
+
+def simdiff_plot_name(cfg: Config) -> str:
+    """图中/表中 SimDiff 曲线名称，区分消融。"""
+    if cfg.simdiff_ablation == "full":
+        return "SimDiff"
+    if cfg.simdiff_ablation == "ni_only":
+        return "SimDiff (NI, K-mean)"
+    return "SimDiff (hist-norm, MoM)"
 
 
 def set_seed(seed: int) -> None:
@@ -152,7 +190,15 @@ def main() -> None:
     parser.add_argument(
         "--eval_only",
         action="store_true",
-        help="跳过训练，只加载 checkpoints/simdiff_weather_best.pt 做测试。未训练时指标为随机权重，无意义。",
+        help="跳过训练，只加载 checkpoint（full/ni_only 用 simdiff_weather_best.pt；mom_only 用 simdiff_weather_best_mom_only.pt）。",
+    )
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        choices=("full", "ni_only", "mom_only"),
+        default=None,
+        help="SimDiff 消融：full=NI+MoM；ni_only=仅去掉 MoM(评估用 K 次均值)，与 full 共用权重；"
+        "mom_only=未来用历史 μ_h,σ_h 归一化+MoM，须单独训练并加载对应 ckpt",
     )
     parser.add_argument(
         "--forecast_num_samples",
@@ -170,6 +216,26 @@ def main() -> None:
         "--skip_baselines",
         action="store_true",
         help="跳过 persistence / MA / DLinear 基线评估",
+    )
+    parser.add_argument(
+        "--skip_prob_metrics",
+        action="store_true",
+        help="跳过 CRPS、按步 CRPS 图与预测区间图（省一次全测试集带 samples 的采样）",
+    )
+    parser.add_argument(
+        "--skip_denoise_traj",
+        action="store_true",
+        help="跳过扩散去噪轨迹热力图（单条链，仍需完整反向采样）",
+    )
+    parser.add_argument(
+        "--skip_training_curves",
+        action="store_true",
+        help="跳过训练/验证损失收敛曲线（仅本次运行过训练时才有数据）",
+    )
+    parser.add_argument(
+        "--skip_error_kde",
+        action="store_true",
+        help="跳过测试集预报误差 KDE 图",
     )
     parser.add_argument(
         "--verify_norm_mom",
@@ -199,8 +265,11 @@ def main() -> None:
         cfg.forecast_num_samples = max(1, int(args.forecast_num_samples))
     if args.mom_groups is not None:
         cfg.mom_num_groups = max(1, int(args.mom_groups))
+    if args.ablation is not None:
+        cfg.simdiff_ablation = args.ablation
 
     cfg.validate_mom_config()
+    cfg.validate_simdiff_ablation()
 
     set_seed(cfg.seed)
     train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
@@ -213,6 +282,18 @@ def main() -> None:
         return
 
     print("Device:", device)
+    print(
+        f"SimDiff 消融: {cfg.simdiff_ablation} | "
+        f"checkpoint: {cfg.simdiff_checkpoint_filename()}"
+    )
+    if cfg.simdiff_ablation == "ni_only":
+        print(
+            "  （ni_only：与 full 共用同一套权重；评估时为 K 次采样算术平均，无 MoM 中位数）"
+        )
+    elif cfg.simdiff_ablation == "mom_only":
+        print(
+            "  （mom_only：训练/推理均为「未来用历史窗统计量」归一化；请使用对应 mom_only 权重）"
+        )
     if (
         cfg.sampling_mode.lower() == "ddim"
         and cfg.sampling_steps is not None
@@ -222,9 +303,13 @@ def main() -> None:
             f"[warn] sampling_steps={cfg.sampling_steps} > timesteps={cfg.timesteps}："
             f"DDIM 将截断为 {cfg.timesteps}，多余子步在离散日程上无对应，曾导致采样发散。"
         )
+    if cfg.simdiff_ablation == "ni_only":
+        _sk = f"K={cfg.forecast_num_samples}（ni_only 评估用算术均值，无 MoM）"
+    else:
+        _sk = f"MoM: K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}"
     print(
         f"采样: mode={cfg.sampling_mode}, steps={cfg.sampling_steps or cfg.timesteps}, "
-        f"ddim_eta={cfg.ddim_eta}, MoM: K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}"
+        f"ddim_eta={cfg.ddim_eta}, {_sk}"
     )
     print(
         f"训练噪声损失: MSE + L1×{cfg.training_noise_l1_weight} + "
@@ -245,7 +330,8 @@ def main() -> None:
         )
 
     model = SimDiffWeather(cfg).to(device)
-    ckpt_path = cfg.resolved_checkpoint_dir() / "simdiff_weather_best.pt"
+    ckpt_path = cfg.resolved_checkpoint_dir() / cfg.simdiff_checkpoint_filename()
+    trainer_ref: Trainer | None = None
 
     if args.eval_only:
         print("\n" + "=" * 60)
@@ -253,7 +339,8 @@ def main() -> None:
         print("=" * 60 + "\n")
         if not ckpt_path.exists():
             raise FileNotFoundError(
-                f"未找到 {ckpt_path}。请先运行: python main.py   （不要加 --eval_only）"
+                f"未找到 {ckpt_path}。请先训练："
+                f" python main.py --ablation {cfg.simdiff_ablation} （不要加 --eval_only）"
             )
         state = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(state["model"], strict=True)
@@ -272,11 +359,24 @@ def main() -> None:
                 )
         model.eval()
     else:
-        trainer = Trainer(cfg, model, train_loader, val_loader, device)
-        trainer.fit()
+        trainer_ref = Trainer(cfg, model, train_loader, val_loader, device)
+        trainer_ref.fit()
 
     # 测试与画图
     model.eval()
+    if (
+        trainer_ref is not None
+        and not args.skip_training_curves
+        and len(trainer_ref.history_train) > 0
+    ):
+        p_curve = cfg.resolved_plot_dir() / "training_convergence.png"
+        plot_training_curves(
+            p_curve,
+            trainer_ref.history_train,
+            trainer_ref.history_val,
+            title="Training convergence (noise prediction loss)",
+        )
+        print(f"Saved plot: {p_curve}")
     noise_losses = []
     with torch.no_grad():
         for hist, fut in test_loader:
@@ -295,13 +395,26 @@ def main() -> None:
         hist = hist.to(device)
         fut = fut.to(device)
         out_s = model.forecast(hist, future=fut)
-        pred_m = out_s.mom
+        pred_m = point_prediction_from_forecast(out_s, cfg)
         mse_s = torch.mean((pred_m - fut) ** 2)
         mae_s = torch.mean(torch.abs(pred_m - fut))
     t_idx = resolve_temperature_feature_index(feat_names)
     temp_name = feat_names[t_idx] if t_idx < len(feat_names) else str(t_idx)
+    if cfg.simdiff_ablation == "ni_only":
+        _hdr = (
+            f"采样评估（单 batch，NI + K 次算术均值，无 MoM；K={cfg.forecast_num_samples}）"
+        )
+    elif cfg.simdiff_ablation == "mom_only":
+        _hdr = (
+            f"采样评估（单 batch，hist 归一化 + MoM：K={cfg.forecast_num_samples}, "
+            f"M={cfg.mom_num_groups}）"
+        )
+    else:
+        _hdr = (
+            f"采样评估（单 batch，MoM：K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}）"
+        )
     _lines = [
-        f"采样评估（单 batch，MoM：K={cfg.forecast_num_samples}, M={cfg.mom_num_groups}）",
+        _hdr,
         f"  主变量 [{temp_name}] MSE: {torch.mean((pred_m[..., t_idx] - fut[..., t_idx]) ** 2).item():.6f} | "
         f"MAE: {torch.mean(torch.abs(pred_m[..., t_idx] - fut[..., t_idx])).item():.6f}",
     ]
@@ -319,15 +432,91 @@ def main() -> None:
     if n_features > 1:
         print(f"【辅助】全特征平均 MSE: {mse_test:.6f} | MAE: {mae_test:.6f}")
 
+    if not args.skip_prob_metrics:
+        crps_mean, crps_h = eval_crps_on_test(
+            model, test_loader, device, t_idx, cfg.pred_len
+        )
+        print(
+            f"\n【概率预测 · {temp_name}】全测试集平均 CRPS: {crps_mean:.6f} "
+            f"(K={cfg.forecast_num_samples} 次样本近似预报分布)"
+        )
+        p_crps = cfg.resolved_plot_dir() / "crps_by_horizon.png"
+        plot_crps_by_horizon(
+            p_crps,
+            crps_h,
+            title=f"CRPS by horizon — {temp_name}",
+        )
+        print(f"Saved plot: {p_crps}")
+
+        hist_pi, fut_pi = next(iter(test_loader))
+        hist_pi = hist_pi.to(device)
+        fut_pi = fut_pi.to(device)
+        with torch.no_grad():
+            out_pi = model.forecast(hist_pi[:1], future=fut_pi[:1], return_samples=True)
+        if out_pi.samples is not None:
+            samp = out_pi.samples[0].cpu().numpy()
+            true_1 = fut_pi[0].cpu().numpy()
+            hist_1 = hist_pi[0].cpu().numpy()
+            pt = point_prediction_from_forecast(out_pi, cfg)[0].cpu().numpy()
+            cov90 = empirical_interval_coverage(
+                samp[..., t_idx] if n_features > 1 else samp.squeeze(-1),
+                true_1[:, t_idx] if n_features > 1 else true_1.squeeze(-1),
+                q_low=0.05,
+                q_high=0.95,
+            )
+            p_int = cfg.resolved_plot_dir() / "forecast_predictive_intervals.png"
+            plot_forecast_predictive_intervals(
+                p_int,
+                np.arange(cfg.seq_len),
+                np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len),
+                hist_1,
+                true_1,
+                samp,
+                t_idx,
+                ylabel=feat_names[t_idx] if t_idx < len(feat_names) else str(t_idx),
+                title=f"90% predictive interval (first test batch) — {temp_name}",
+                q_low=0.05,
+                q_high=0.95,
+                point_pred=pt,
+                point_label=simdiff_plot_name(cfg),
+            )
+            print(f"Saved plot: {p_int}")
+            print(
+                f"  （示例窗）名义90% 区间逐时刻经验覆盖率: {cov90 * 100:.1f}% "
+                f"（单窗参考，非全测试集）"
+            )
+
     plot_dir = cfg.resolved_plot_dir()
     c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
     ylabel = feat_names[c_vis] if c_vis < len(feat_names) else str(c_vis)
     t_hist = np.arange(cfg.seq_len)
     t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
 
+    if not args.skip_denoise_traj:
+        hd0, fd0 = next(iter(test_loader))
+        hd0 = hd0[:1].to(device)
+        fd0 = fd0[:1].to(device)
+        with torch.no_grad():
+            traj_frames = model.get_denoise_trajectory_physical(
+                hd0, fd0, cfg.denoise_trajectory_max_points
+            )
+        p_den = plot_dir / "diffusion_denoise_trajectory.png"
+        plot_denoise_trajectory_heatmap(
+            p_den,
+            traj_frames,
+            t_idx,
+            ylabel,
+            title=f"Denoising trajectory (test batch[0]) — {temp_name} | "
+            f"{cfg.sampling_mode.upper()}",
+        )
+        print(f"Saved plot: {p_den}")
+
+    _sdn = simdiff_plot_name(cfg)
     horizon_maes: dict[str, np.ndarray] = {
-        "SimDiff": eval_horizon_mae(
-            lambda h, f: model.forecast(h, future=f).mom,
+        _sdn: eval_horizon_mae(
+            lambda h, f: point_prediction_from_forecast(
+                model.forecast(h, future=f), model.cfg
+            ),
             test_loader,
             device,
             cfg.pred_len,
@@ -335,13 +524,14 @@ def main() -> None:
             n_features,
         )
     }
-    bar_names: list[str] = ["SimDiff"]
+    bar_names: list[str] = [_sdn]
     bar_maes: list[float] = [float(mae_ch[t_idx])]
     bar_mses: list[float] = [float(mse_ch[t_idx])]
 
     dlm: DLinearMap | None = None
     lstm_m: BaselineLSTM | None = None
     trans_m: BaselineTransformer | None = None
+    residual_multi_for_kde: dict[str, np.ndarray] | None = None
 
     if not args.skip_baselines:
         print("\n--- 基线（原始尺度，全测试集）---")
@@ -445,6 +635,11 @@ def main() -> None:
         bar_maes.append(float(at_b))
         bar_mses.append(float(mt_b))
 
+        r_sd, _ = collect_test_forecast_errors(model, test_loader, device, t_idx)
+        r_dl = collect_channel_residuals(wrap_dl, test_loader, device, t_idx)
+        r_ls = collect_channel_residuals(wrap_lstm, test_loader, device, t_idx)
+        residual_multi_for_kde = {_sdn: r_sd, "DLinear": r_dl, "LSTM": r_ls}
+
         trans_m = BaselineTransformer(
             sl,
             pl,
@@ -487,7 +682,9 @@ def main() -> None:
         bar_mses.append(float(mt_b))
 
         yt, yp = collect_pooled_predictions(
-            lambda h, f: model.forecast(h, future=f).mom,
+            lambda h, f: point_prediction_from_forecast(
+                model.forecast(h, future=f), model.cfg
+            ),
             test_loader,
             device,
             t_idx,
@@ -497,7 +694,7 @@ def main() -> None:
             p_sc,
             yt,
             yp,
-            title=f"SimDiff: predicted vs true ({temp_name})",
+            title=f"{_sdn}: predicted vs true ({temp_name})",
         )
         print(f"Saved plot: {p_sc}")
 
@@ -506,7 +703,9 @@ def main() -> None:
         fut_b = fut_b.to(device)
         with torch.no_grad():
             preds_np: dict[str, np.ndarray] = {
-                "SimDiff": model.forecast(hist_b, future=fut_b).mom.cpu().numpy(),
+                _sdn: point_prediction_from_forecast(
+                    model.forecast(hist_b, future=fut_b), model.cfg
+                ).cpu().numpy(),
                 "DLinear": dlm(hist_b).cpu().numpy(),
                 "LSTM": lstm_m(hist_b).cpu().numpy(),
                 "Plain Transformer": trans_m(hist_b).cpu().numpy(),
@@ -548,6 +747,36 @@ def main() -> None:
         )
         print(f"Saved plot: {p_grid}")
 
+    if not args.skip_error_kde:
+        res_e, ae_e = collect_test_forecast_errors(
+            model, test_loader, device, t_idx
+        )
+        p_kde = plot_dir / "error_distribution_kde.png"
+        plot_error_kde(
+            p_kde,
+            res_e,
+            ae_e,
+            unit_label=feat_names[t_idx] if t_idx < len(feat_names) else temp_name,
+            title=f"Test error KDE — {temp_name} ({simdiff_plot_name(cfg)})",
+            residual_multi=residual_multi_for_kde,
+        )
+        print(f"Saved plot: {p_kde}")
+        if residual_multi_for_kde is not None:
+            p3 = plot_dir / "residual_kde_three_models.png"
+            plot_residual_kde_multi(
+                p3,
+                residual_multi_for_kde,
+                unit_label=feat_names[t_idx] if t_idx < len(feat_names) else temp_name,
+                title=f"Residual KDE: SimDiff vs DLinear vs LSTM — {temp_name}",
+            )
+            print(f"Saved plot: {p3}")
+            print("  （左侧子图为多模型时，error_distribution_kde.png 左栏标题为 Residual (multi-model)）")
+        else:
+            print(
+                "  [hint] 未跑学习型基线：KDE 左栏仅 SimDiff。"
+                "需要三模型对比请不要加 --skip_baselines，并重新运行完整 main.py。"
+            )
+
     p_metrics = plot_dir / "metrics_comparison_mae_mse.png"
     plot_metrics_bars(
         p_metrics,
@@ -574,12 +803,12 @@ def main() -> None:
         fo = model.forecast(hist[:1], future=fut[:1])
     hist0 = hist[0].cpu().numpy()
     true0 = fut[0].cpu().numpy()
-    pred0 = fo.mom[0].cpu().numpy()
+    pred0 = point_prediction_from_forecast(fo, cfg)[0].cpu().numpy()
 
     plt.figure(figsize=(10, 4))
     plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
     plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="C1")
-    plt.plot(t_fut, pred0[:, c_vis], label="SimDiff (MoM)", color="C2", linestyle="--")
+    plt.plot(t_fut, pred0[:, c_vis], label=_sdn, color="C2", linestyle="--")
     plt.axvline(cfg.seq_len - 0.5, color="gray", linestyle=":")
     plt.xlabel("time step (index)")
     plt.ylabel(ylabel)
