@@ -12,6 +12,62 @@ from torch.utils.data import DataLoader, Dataset
 
 from config.config import Config
 
+# 毕设 5 数据集：路径与默认目标列（单变量预测；选「官方常用 OT / 主变量」最易与文献对齐）
+_DATASET_PATHS: dict[str, str] = {
+    "weather": "data/weather.csv",
+    "etth1": "data/ETTh1.csv",
+    "ettm1": "data/ETTm1.csv",
+    "exchange": "data/exchange_rate.csv",
+    "wind": "data/wind.csv",
+}
+_DATASET_DEFAULT_TARGET: dict[str, str | None] = {
+    "weather": None,  # 用气温列解析
+    "etth1": "OT",
+    "ettm1": "OT",
+    "exchange": "0",  # 与论文常用「汇率/美元」单变量列名一致；可改 --target OT
+    "wind": "ture_w_speed",  # 源表头即此拼写，表示实风速
+}
+
+
+def _apply_data_preset(cfg: Config) -> None:
+    p = (cfg.data_preset or "").strip().lower()
+    if p and p in _DATASET_PATHS:
+        cfg.data_path = _DATASET_PATHS[p]
+        if cfg.target_column is None and p in _DATASET_DEFAULT_TARGET:
+            t = _DATASET_DEFAULT_TARGET[p]
+            if t is not None:
+                cfg.target_column = t
+
+
+def _select_univariate_column(
+    matrix: np.ndarray, names: list[str], cfg: Config
+) -> tuple[np.ndarray, list[str]]:
+    """在单变量模式下截取一列；优先 target_column，其次 weather 气温名。"""
+    tcol = cfg.target_column
+    if tcol is not None:
+        if isinstance(tcol, int):
+            j = int(tcol)
+        else:
+            cands = [str(tcol), str(tcol).strip()]
+            j = -1
+            for i, n in enumerate(names):
+                if n in cands or n.strip() == tcol or str(n) == str(tcol):
+                    j = i
+                    break
+            if j < 0:
+                raise ValueError(f"未找到 target_column={tcol!r}，表头: {names[:20]}")
+        return matrix[:, j : j + 1], [names[j]]
+    if (cfg.data_preset or "").lower() == "weather" or bool(cfg.temperature_only):
+        tname = resolve_temperature_column_name(names)
+        ti = names.index(tname)
+        return matrix[:, ti : ti + 1], [tname]
+    if len(names) == 1:
+        return matrix[:, 0:1], names
+    raise ValueError(
+        "univariate 且未指定 --target / target_column 且无法自动选列；"
+        f"表头: {names[:20]}"
+    )
+
 
 def resolve_temperature_column_name(feature_names: list[str]) -> str:
     """在 weather表头中定位气温列名（与 main 中逻辑一致）。"""
@@ -90,12 +146,15 @@ def fit_future_marginal_stats(
 
 
 def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, list[str]]:
+    _apply_data_preset(cfg)
     path = cfg.resolved_data_path()
     if not path.exists():
         raise FileNotFoundError(f"未找到数据文件: {path}")
 
     matrix, names = load_weather_matrix(path)
-    if getattr(cfg, "temperature_only", True):
+    if bool(getattr(cfg, "univariate", True)):
+        matrix, names = _select_univariate_column(matrix, names, cfg)
+    elif getattr(cfg, "temperature_only", True):
         tcol = resolve_temperature_column_name(names)
         ti = names.index(tcol)
         matrix = matrix[:, ti : ti + 1]

@@ -11,22 +11,17 @@
 
 ```
 Simdiff_weather/
-├── data/
-│   ├── weather.csv          # 原始数据（已提供）
-│   └── processed/           # 预留：可存放预处理 .npy
-├── models/
-│   ├── diffusion.py         # 余弦日程、加噪、DDPM 反向一步
-│   ├── network.py           # 时间步嵌入 + Transformer 去噪网络
-│   └── simdiff.py           # 归一化独立性 + 训练损失 + 采样预测
-├── utils/
-│   ├── data_loader.py       # CSV 读取、滑动窗口、划分 train/val/test
-│   ├── normalizer.py        # 历史/未来独立归一化与推理用尺度估计
-│   └── trainer.py           # 训练 / 验证 / 早停 / 保存权重
-├── config/
-│   └── config.py            # 超参数
-├── main.py                  # 入口：训练 + 测试 + 示例曲线
-├── requirements.txt
-└── README.md
+├── data/                    # 多 CSV（见上文「毕设多数据集」表）
+├── outputs/metrics/         # --save_run_metrics_dir 的 JSON
+├── outputs/paper/           # 表与论文图 01~04
+├── scripts/                 # run_thesis_sweep、ablation_etth1、render_thesis_curves 等
+├── plots/diagnostics/      # 仅 --full_plots
+├── models/                  # diffusion, network（含 Patch / RoPE）, simdiff, mr_denoiser
+├── utils/                   # data_loader, trainer, baselines, paper_output
+├── config/config.py
+├── main.py
+├── generate_paper_artifacts.py
+└── requirements.txt
 ```
 
 ---
@@ -78,9 +73,72 @@ python main.py --eval_only
 
 | 输出 | 说明 |
 |------|------|
-| `checkpoints/simdiff_weather_best.pt` | 验证集最优模型 |
-| `plots/forecast_example.png` | 测试集一条样本的预测曲线 |
-| 终端日志 | `train_loss`、`val_mse`（噪声预测）、学习率；`Test noise MSE`；采样 MSE/MAE（多特征混合尺度，见 `main.py` 说明） |
+| `checkpoints/simdiff_{数据集}_p{步长}_{tag}.pt` | 验证集最优（tag：simdiff / mrdiff / ours / …） |
+| `plots/diagnostics/*.png` | 仅当加 `--full_plots` 时写入调试图 |
+| `outputs/paper/` | 见下文「毕设多数据集、表与图」；表与主图**不在** `plots/` 根目录，避免与调试图混放 |
+| 终端日志 | `train_loss`、`val_mse`（噪声预测）、学习率；`Test noise MSE`；全测试集 MSE/MAE |
+
+---
+
+## 毕设多数据集、表与图（5 数据 × 4 步长 + 消融）
+
+**数据与预测目标**（`config.data_preset` + `utils/data_loader.py` 中默认列；单变量即可，无需额外标注）：
+
+| 数据集 | 文件 | 默认预测列 | 说明 |
+|--------|------|------------|------|
+| Weather | `data/weather.csv` | 气温 `T (degC)` 等 | 与 `temperature_only` 解析一致 |
+| ETTh1 / ETTm1 | `data/ETTh1.csv` / `ETTm1.csv` | `OT` | 与常见长序列基线一致 |
+| Exchange | `data/exchange_rate.csv` | `0` | 与「USD 汇率」类任务对应的单变量列名 |
+| Wind | `data/wind.csv` | `ture_w_speed` | 数据表头为该拼写，表示实风速 |
+
+**主对比**（DLinear、iTransformer、mr-Diff、SimDiff、改进版 = Patch+RoPE）：`main.py` 每次会训练/评估 DLinear 与 iTransformer，扩散类三种需分别训练以得到不同 `checkpoints/…pt`。**指标 JSON** 使用 `--save_run_metrics_dir outputs/metrics`，每格文件名形如 `etth1_p48_simdiff.json`、`…_mrdiff.json`、`…_ours.json`。
+
+**一键串行主实验 + 消融 + 出表/图**（最省事，但耗时极长；可用 `run_thesis_sweep.sh` 中注释拆步）：
+
+```bash
+cd /path/to/Simdiff_weather
+pip install -r requirements.txt
+chmod +x scripts/run_thesis_sweep.sh
+./scripts/run_thesis_sweep.sh
+```
+
+**仅已训好权重、合并表与论文图**（`outputs/metrics` 中 JSON 已齐）：
+
+```bash
+python generate_paper_artifacts.py --metrics_dir outputs/metrics --out_dir outputs/paper
+# 或：python -m utils.paper_output all --metrics_dir outputs/metrics --out_dir outputs/paper
+```
+
+输出目录（自动创建 `00_README_目录说明.txt`）：
+
+- `outputs/paper/04_tables/` — 表 1 主对比、表 2 消融（`table2` 名含 `_p168` 等防覆盖）  
+- `outputs/paper/02_horizon_by_predlen/` — 多 `pred_len` 下改进版 MAE/MSE 柱图  
+- `outputs/paper/03_ablation_module/` — ETTh1 消融 MAE 与 MSE 柱图  
+- `outputs/paper/01_fitting_curves/pred_len_*/` — 由下方脚本生成的「真值 vs 预测」**仅改进版**曲线；**五模型同图**用：
+
+```bash
+python scripts/render_thesis_curves.py --pred_len 168 --out_subdir pred_len_168
+```
+
+（依赖各数据集对应步长的 `simdiff_*_p168_{simdiff,mrdiff,ours}.pt` 已存在。）
+
+**仅做 ETTh1(OT) 消融（pred_len=168）**：
+
+```bash
+chmod +x scripts/ablation_etth1.sh
+./scripts/ablation_etth1.sh
+```
+
+**单条训练示例**（例如 Weather、预测 48 步、改进版 + 写指标）：
+
+```bash
+python main.py --data_preset weather --pred_len 48 --use_patch --use_rope --skip_lstm --save_run_metrics_dir outputs/metrics
+```
+
+**Patch / RoPE / 步长**（`config` 或命令行）：
+
+- `--use_patch` / `--use_rope`；`--patch_size 8`；`--patch_stride` 省略则与 `patch_size` 相同（不重叠），小于 `patch_size` 则为重叠分块。  
+- RoPE 要求 `d_model // n_heads` 为偶数（默认 128/4=32，满足）。
 
 **5）可选：独立未来归一化（论文叙述向 SimDiff「统计解耦」靠拢时）**
 

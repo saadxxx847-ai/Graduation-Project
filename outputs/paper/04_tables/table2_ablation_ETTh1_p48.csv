@@ -1,0 +1,5 @@
+设置,MSE/MAE
+SimDiff 基线 (NI+MoM),
++Patch,
++RoPE,
+Patch+RoPE (改进),2.391751 / 1.169282

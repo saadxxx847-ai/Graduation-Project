@@ -7,8 +7,11 @@ SimDiff-Weather 主入口：默认 **先训练再评估**。
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import random
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -23,7 +26,7 @@ from config.config import Config
 from models.simdiff import SimDiffWeather, point_prediction_from_forecast
 from utils.baselines import (
     BaselineLSTM,
-    BaselineTransformer,
+    ITransformer,
     DLinearMap,
     collect_channel_residuals,
     collect_pooled_predictions,
@@ -123,12 +126,88 @@ def evaluate_test_loader(
 
 
 def simdiff_plot_name(cfg: Config) -> str:
-    """图中/表中 SimDiff 曲线名称，区分消融。"""
-    if cfg.simdiff_ablation == "full":
-        return "SimDiff"
+    """图中/表中 SimDiff / mr-Diff 曲线名称，区分改进与消融。"""
+    if bool(getattr(cfg, "mrdiff_denoiser", False)):
+        return "mr-Diff"
     if cfg.simdiff_ablation == "ni_only":
         return "SimDiff (NI, K-mean)"
-    return "SimDiff (hist-norm, MoM)"
+    if cfg.simdiff_ablation == "mom_only":
+        return "SimDiff (hist-norm, MoM)"
+    if not bool(getattr(cfg, "use_patch", False)) and not bool(
+        getattr(cfg, "use_rope", False)
+    ):
+        return "SimDiff"
+    if bool(getattr(cfg, "use_patch", False)) and bool(getattr(cfg, "use_rope", False)):
+        # 图例/曲线名用纯英文，避免「中文 + SimDiff」混排时 DejaVu 与 CJK 回退字体接缝处变宽像多空格
+        return "Improved SimDiff"
+    if bool(getattr(cfg, "use_patch", False)):
+        return "SimDiff (+Patch)"
+    return "SimDiff (+RoPE)"
+
+
+def _paper_diff_variant_id(cfg: Config) -> str:
+    """与论文 3 种扩散主对比对齐：mrdiff / 基线 simdiff / ours；其余 (仅 Patch 或仅 RoPE) 为 other。"""
+    if cfg.mrdiff_denoiser:
+        return "mrdiff"
+    if cfg.use_patch and cfg.use_rope:
+        return "ours"
+    if not cfg.use_patch and not cfg.use_rope:
+        return "simdiff"
+    return "other"
+
+
+def _load_sibling_diffusion(
+    base_cfg: Config, device: torch.device, *, mrdiff: bool, use_patch: bool, use_rope: bool
+) -> SimDiffWeather | None:
+    c = copy.deepcopy(base_cfg)
+    c.mrdiff_denoiser = mrdiff
+    c.use_patch = use_patch
+    c.use_rope = use_rope
+    p = c.resolved_checkpoint_dir() / c.simdiff_checkpoint_filename()
+    if not p.is_file():
+        return None
+    st = torch.load(p, map_location=device, weights_only=False)
+    meta = st.get("meta") or {}
+    if "timesteps" in meta:
+        c.timesteps = int(meta["timesteps"])
+    if meta.get("sampling_steps") is not None:
+        c.sampling_steps = int(meta["sampling_steps"])
+    m = SimDiffWeather(c).to(device)
+    m.load_state_dict(st["model"], strict=True)
+    m.eval()
+    return m
+
+
+def _paper_diffusion_stack(
+    base_cfg: Config, device: torch.device, main: SimDiffWeather
+) -> list[tuple[str, SimDiffWeather]]:
+    """
+    论文主对比：mr-Diff、SimDiff(基线)、Improved SimDiff(ours) 同序；
+    当前 run 用 main，其余从 checkpoint 补全；缺权重则少一条。
+    """
+    if base_cfg.simdiff_ablation != "full" or _paper_diff_variant_id(base_cfg) == "other":
+        return [(simdiff_plot_name(base_cfg), main)]
+    vid = _paper_diff_variant_id(base_cfg)
+    out: list[tuple[str, SimDiffWeather]] = []
+    slots: list[tuple[str, str, bool, bool, bool]] = [
+        ("mr-Diff", "mrdiff", True, False, False),
+        ("SimDiff", "simdiff", False, False, False),
+        ("Improved SimDiff", "ours", False, True, True),
+    ]
+    for label, key, md, up, ro in slots:
+        if vid == key:
+            out.append((label, main))
+        else:
+            sib = _load_sibling_diffusion(base_cfg, device, mrdiff=md, use_patch=up, use_rope=ro)
+            if sib is not None:
+                out.append((label, sib))
+            else:
+                ck = copy.deepcopy(base_cfg)
+                ck.mrdiff_denoiser = md
+                ck.use_patch, ck.use_rope = up, ro
+                miss = base_cfg.resolved_checkpoint_dir() / ck.simdiff_checkpoint_filename()
+                print(f"  [hint] 未找到 {miss.name}，同图/柱图不显示 {label}；请先训练该变体。")
+    return out
 
 
 def set_seed(seed: int) -> None:
@@ -145,12 +224,25 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  python main.py                      # 完整训练 + 测试 + 画图（推荐）
+  python main.py                      # 训练+测试；默认 **不写** 诊断图到 plots/，见 --full_plots
+  python main.py --full_plots         # 同时保存旧版散点/对比/KDE/指标等到 plots/
   python main.py --epochs 30          # 指定轮数
   python main.py --eval_only          # 仅评估（必须先训练生成 checkpoint）
+  论文用图/表见：python generate_paper_artifacts.py（表与图在 outputs/paper/，调试图在 plots/diagnostics/）
 """,
     )
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=None,
+        help="优化器学习率，默认见 config（当前默认 0.003）",
+    )
+    parser.add_argument(
+        "--no_fp16_predict",
+        action="store_true",
+        help="预测/全测试集评估时不用半精度 autocast（默认 CUDA 上开启以加速采样）",
+    )
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument(
         "--all_features",
@@ -218,6 +310,11 @@ def main() -> None:
         help="跳过 persistence / MA / DLinear 基线评估",
     )
     parser.add_argument(
+        "--include_stat_baselines",
+        action="store_true",
+        help="将 Persistence / 移动平均 纳入柱图与按步 MAE（默认仅 DLinear、iTransformer 与扩散类主对比）",
+    )
+    parser.add_argument(
         "--skip_prob_metrics",
         action="store_true",
         help="跳过 CRPS、按步 CRPS 图与预测区间图（省一次全测试集带 samples 的采样）",
@@ -242,13 +339,88 @@ def main() -> None:
         action="store_true",
         help="仅运行归一化/MoM 快速自检后退出（不训练）",
     )
+    parser.add_argument(
+        "--data_preset",
+        type=str,
+        default=None,
+        help="weather | etth1 | ettm1 | exchange | wind（将自动设置数据路径与默认目标列）",
+    )
+    parser.add_argument(
+        "--pred_len",
+        type=int,
+        default=None,
+        help="预测步长（主实验 48/72/168/192；消融 ETTh1(OT) 建议 168）",
+    )
+    parser.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help="单变量目标列名（如 OT、0、ture_w_speed）；覆盖 preset 默认",
+    )
+    parser.add_argument("--use_patch", action="store_true", help="启用 Patch 分块嵌入")
+    parser.add_argument("--use_rope", action="store_true", help="显式 RoPE（不用可学习绝对位置）")
+    parser.add_argument("--patch_size", type=int, default=None)
+    parser.add_argument("--patch_stride", type=int, default=None)
+    parser.add_argument(
+        "--mrdiff",
+        action="store_true",
+        help="使用 1D 卷积去噪网作为 mr-Diff 对照（含同一扩散与 NI/MoM）",
+    )
+    parser.add_argument(
+        "--multivariate",
+        action="store_true",
+        help="使用 CSV 全部数值列（多变量）；默认单变量仅目标列",
+    )
+    parser.add_argument(
+        "--skip_lstm",
+        action="store_true",
+        help="不在基线对比中训练 LSTM（论文五模型表可省略 LSTM）",
+    )
+    parser.add_argument(
+        "--print_result_json",
+        action="store_true",
+        help="测试结束后多打一行 RESULT_JSON 便于记录主变量 MSE/MAE 到表",
+    )
+    parser.add_argument(
+        "--save_run_metrics_dir",
+        type=str,
+        default=None,
+        help="将本 run 的 DLinear / iTransformer / 当前扩散 指标写入该目录下 JSON，供 build_paper 合并成总表",
+    )
+    parser.add_argument(
+        "--full_plots",
+        action="store_true",
+        help="保存全部历史诊断 PNG 到 plot_dir；默认不保存。论文用图见 generate_paper_artifacts.py / utils.paper_output",
+    )
     args = parser.parse_args()
 
     cfg = Config()
+    if args.data_preset:
+        cfg.data_preset = args.data_preset
+    if args.pred_len is not None:
+        cfg.pred_len = int(args.pred_len)
+    if args.target is not None:
+        cfg.target_column = args.target.strip()
+    if args.use_patch:
+        cfg.use_patch = True
+    if args.use_rope:
+        cfg.use_rope = True
+    if args.patch_size is not None:
+        cfg.patch_size = int(args.patch_size)
+    if args.patch_stride is not None:
+        cfg.patch_stride = int(args.patch_stride)
+    if args.mrdiff:
+        cfg.mrdiff_denoiser = True
+    if args.multivariate:
+        cfg.univariate = False
     if args.all_features:
         cfg.temperature_only = False
     if args.epochs is not None:
         cfg.epochs = args.epochs
+    if args.learning_rate is not None:
+        cfg.learning_rate = float(args.learning_rate)
+    if bool(getattr(args, "no_fp16_predict", False)):
+        cfg.infer_fp16 = False
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
     if args.seq_len is not None:
@@ -270,6 +442,7 @@ def main() -> None:
 
     cfg.validate_mom_config()
     cfg.validate_simdiff_ablation()
+    cfg.validate_arch()
 
     set_seed(cfg.seed)
     train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
@@ -282,6 +455,19 @@ def main() -> None:
         return
 
     print("Device:", device)
+    print(
+        f"数据: preset={cfg.data_preset} | 路径: {cfg.data_path} | "
+        f"seq_len={cfg.seq_len} pred_len={cfg.pred_len}"
+    )
+    print(
+        f"网络: use_patch={cfg.use_patch} use_rope={cfg.use_rope} "
+        f"patch=({cfg.patch_size},{cfg.patch_stride}) mrdiff={getattr(cfg, 'mrdiff_denoiser', False)}"
+    )
+    print(
+        f"训练: lr={cfg.learning_rate} epochs={cfg.epochs} | "
+        f"预测半精度(仅采样): infer_fp16={getattr(cfg, 'infer_fp16', False)} "
+        f"（关: --no_fp16_predict）"
+    )
     print(
         f"SimDiff 消融: {cfg.simdiff_ablation} | "
         f"checkpoint: {cfg.simdiff_checkpoint_filename()}"
@@ -362,10 +548,12 @@ def main() -> None:
         trainer_ref = Trainer(cfg, model, train_loader, val_loader, device)
         trainer_ref.fit()
 
-    # 测试与画图
+    # 测试与画图（仅 --full_plots 时写入 plot_dir 下历史诊断图）
+    do_plots = bool(getattr(args, "full_plots", False))
     model.eval()
     if (
-        trainer_ref is not None
+        do_plots
+        and trainer_ref is not None
         and not args.skip_training_curves
         and len(trainer_ref.history_train) > 0
     ):
@@ -432,7 +620,7 @@ def main() -> None:
     if n_features > 1:
         print(f"【辅助】全特征平均 MSE: {mse_test:.6f} | MAE: {mae_test:.6f}")
 
-    if not args.skip_prob_metrics:
+    if not args.skip_prob_metrics and do_plots:
         crps_mean, crps_h = eval_crps_on_test(
             model, test_loader, device, t_idx, cfg.pred_len
         )
@@ -485,6 +673,8 @@ def main() -> None:
                 f"  （示例窗）名义90% 区间逐时刻经验覆盖率: {cov90 * 100:.1f}% "
                 f"（单窗参考，非全测试集）"
             )
+    elif not args.skip_prob_metrics and not do_plots:
+        print("（已跳过 CRPS/预测区间，未开 --full_plots）")
 
     plot_dir = cfg.resolved_plot_dir()
     c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
@@ -492,7 +682,7 @@ def main() -> None:
     t_hist = np.arange(cfg.seq_len)
     t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
 
-    if not args.skip_denoise_traj:
+    if do_plots and not args.skip_denoise_traj:
         hd0, fd0 = next(iter(test_loader))
         hd0 = hd0[:1].to(device)
         fd0 = fd0[:1].to(device)
@@ -512,67 +702,81 @@ def main() -> None:
         print(f"Saved plot: {p_den}")
 
     _sdn = simdiff_plot_name(cfg)
-    horizon_maes: dict[str, np.ndarray] = {
-        _sdn: eval_horizon_mae(
-            lambda h, f: point_prediction_from_forecast(
-                model.forecast(h, future=f), model.cfg
-            ),
-            test_loader,
-            device,
-            cfg.pred_len,
-            t_idx,
-            n_features,
-        )
-    }
-    bar_names: list[str] = [_sdn]
-    bar_maes: list[float] = [float(mae_ch[t_idx])]
-    bar_mses: list[float] = [float(mse_ch[t_idx])]
+    paper_stack = _paper_diffusion_stack(cfg, device, model)
+
+    horizon_maes: dict[str, np.ndarray] = {}
+    bar_names: list[str] = []
+    bar_maes: list[float] = []
+    bar_mses: list[float] = []
 
     dlm: DLinearMap | None = None
     lstm_m: BaselineLSTM | None = None
-    trans_m: BaselineTransformer | None = None
     residual_multi_for_kde: dict[str, np.ndarray] | None = None
+    dlinear_mse: float | None = None
+    dlinear_mae: float | None = None
+    itrans_mse: float | None = None
+    itrans_mae: float | None = None
+    preds_np: dict[str, np.ndarray] = {}
 
-    if not args.skip_baselines:
-        print("\n--- 基线（原始尺度，全测试集）---")
+    if args.skip_baselines:
+        for lab, mm in paper_stack:
+            horizon_maes[lab] = eval_horizon_mae(
+                lambda h, f, mmm=mm: point_prediction_from_forecast(
+                    mmm.forecast(h, future=f), mmm.cfg
+                ),
+                test_loader,
+                device,
+                cfg.pred_len,
+                t_idx,
+                n_features,
+            )
+            _mse_a, _mae_a, mae_chx, mse_chx = evaluate_test_loader(
+                mm, test_loader, device, n_features
+            )
+            bar_names.append(lab)
+            bar_maes.append(float(mae_chx[t_idx]))
+            bar_mses.append(float(mse_chx[t_idx]))
+    else:
         pl, sl, C = cfg.pred_len, cfg.seq_len, n_features
 
-        def wrap_persist(h):
-            return persistence_forecast(h, pl)
+        if args.include_stat_baselines:
+            print("\n--- 统计基线（Persistence / 移动平均，与论文主表无关时可省略）---")
 
-        def wrap_ma(h):
-            return moving_average_forecast(h, pl, window=min(24, sl))
+            def wrap_persist(h):
+                return persistence_forecast(h, pl)
 
-        mse_b, mae_b = eval_forecasts_mse_mae(wrap_persist, test_loader, device)
-        mt_b, at_b = eval_channel_mse_mae(wrap_persist, test_loader, device, t_idx)
-        print_baseline_block("Persistence", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
-        horizon_maes["Persistence"] = eval_horizon_mae(
-            lambda h, f: persistence_forecast(h, pl),
-            test_loader,
-            device,
-            cfg.pred_len,
-            t_idx,
-            n_features,
-        )
-        bar_names.append("Persistence")
-        bar_maes.append(float(at_b))
-        bar_mses.append(float(mt_b))
+            def wrap_ma(h):
+                return moving_average_forecast(h, pl, window=min(24, sl))
 
-        mse_b, mae_b = eval_forecasts_mse_mae(wrap_ma, test_loader, device)
-        mt_b, at_b = eval_channel_mse_mae(wrap_ma, test_loader, device, t_idx)
-        print_baseline_block(
-            f"Moving-avg (w={min(24, sl)})", mse_b, mae_b, mt_b, at_b, temp_name, n_features
-        )
-        horizon_maes[f"MA(w={min(24, sl)})"] = eval_horizon_mae(
-            lambda h, f: moving_average_forecast(h, pl, window=min(24, sl)),
-            test_loader,
-            device,
-            cfg.pred_len,
-            t_idx,
-            n_features,
-        )
+            mse_b, mae_b = eval_forecasts_mse_mae(wrap_persist, test_loader, device)
+            mt_b, at_b = eval_channel_mse_mae(wrap_persist, test_loader, device, t_idx)
+            print_baseline_block("Persistence", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
+            horizon_maes["Persistence"] = eval_horizon_mae(
+                lambda h, f: persistence_forecast(h, pl),
+                test_loader,
+                device,
+                cfg.pred_len,
+                t_idx,
+                n_features,
+            )
+            bar_names.append("Persistence")
+            bar_maes.append(float(at_b))
+            bar_mses.append(float(mt_b))
 
-        print("\n--- 学习型基线（验证集 MSE 早停，与 SimDiff 同 epoch 上限）---")
+            mse_b, mae_b = eval_forecasts_mse_mae(wrap_ma, test_loader, device)
+            mt_b, at_b = eval_channel_mse_mae(wrap_ma, test_loader, device, t_idx)
+            print_baseline_block(
+                f"Moving-avg (w={min(24, sl)})", mse_b, mae_b, mt_b, at_b, temp_name, n_features
+            )
+            horizon_maes[f"MA(w={min(24, sl)})"] = eval_horizon_mae(
+                lambda h, f: moving_average_forecast(h, pl, window=min(24, sl)),
+                test_loader,
+                device,
+                cfg.pred_len,
+                t_idx,
+                n_features,
+            )
+        print("\n--- 学习型基线：DLinear(2023)、iTransformer(2024)；扩散类见下节 ---")
         dlm = DLinearMap(sl, pl, C)
         dlm = fit_regression_model(
             dlm,
@@ -603,44 +807,48 @@ def main() -> None:
         bar_names.append("DLinear")
         bar_maes.append(float(at_b))
         bar_mses.append(float(mt_b))
+        dlinear_mse, dlinear_mae = float(mt_b), float(at_b)
 
-        lstm_m = BaselineLSTM(C, pl, cfg.baseline_lstm_hidden, cfg.baseline_lstm_layers, cfg.dropout)
-        lstm_m = fit_regression_model(
-            lstm_m,
-            train_loader,
-            val_loader,
-            device,
-            max_epochs=cfg.baseline_max_epochs,
-            lr=cfg.baseline_lr,
-            patience=cfg.baseline_early_stop_patience,
-            grad_clip_max_norm=cfg.baseline_grad_clip_max_norm,
-            name="LSTM",
-        )
+        wrap_lstm: Callable | None
+        if not bool(getattr(args, "skip_lstm", False)):
+            lstm_m = BaselineLSTM(
+                C, pl, cfg.baseline_lstm_hidden, cfg.baseline_lstm_layers, cfg.dropout
+            )
+            lstm_m = fit_regression_model(
+                lstm_m,
+                train_loader,
+                val_loader,
+                device,
+                max_epochs=cfg.baseline_max_epochs,
+                lr=cfg.baseline_lr,
+                patience=cfg.baseline_early_stop_patience,
+                grad_clip_max_norm=cfg.baseline_grad_clip_max_norm,
+                name="LSTM",
+            )
 
-        def wrap_lstm(h):
-            return lstm_m(h)
+            def _wrap_lstm(h: torch.Tensor) -> torch.Tensor:
+                return lstm_m(h)
 
-        mse_b, mae_b = eval_forecasts_mse_mae(wrap_lstm, test_loader, device)
-        mt_b, at_b = eval_channel_mse_mae(wrap_lstm, test_loader, device, t_idx)
-        print_baseline_block("LSTM", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
-        horizon_maes["LSTM"] = eval_horizon_mae(
-            lambda h, f: lstm_m(h),
-            test_loader,
-            device,
-            cfg.pred_len,
-            t_idx,
-            n_features,
-        )
-        bar_names.append("LSTM")
-        bar_maes.append(float(at_b))
-        bar_mses.append(float(mt_b))
+            wrap_lstm = _wrap_lstm
+            mse_b, mae_b = eval_forecasts_mse_mae(wrap_lstm, test_loader, device)
+            mt_b, at_b = eval_channel_mse_mae(wrap_lstm, test_loader, device, t_idx)
+            print_baseline_block("LSTM", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
+            horizon_maes["LSTM"] = eval_horizon_mae(
+                lambda h, f: lstm_m(h),
+                test_loader,
+                device,
+                cfg.pred_len,
+                t_idx,
+                n_features,
+            )
+            bar_names.append("LSTM")
+            bar_maes.append(float(at_b))
+            bar_mses.append(float(mt_b))
+        else:
+            lstm_m = None
+            wrap_lstm = None
 
-        r_sd, _ = collect_test_forecast_errors(model, test_loader, device, t_idx)
-        r_dl = collect_channel_residuals(wrap_dl, test_loader, device, t_idx)
-        r_ls = collect_channel_residuals(wrap_lstm, test_loader, device, t_idx)
-        residual_multi_for_kde = {_sdn: r_sd, "DLinear": r_dl, "LSTM": r_ls}
-
-        trans_m = BaselineTransformer(
+        itrans = ITransformer(
             sl,
             pl,
             C,
@@ -649,8 +857,8 @@ def main() -> None:
             num_layers=cfg.baseline_transformer_layers,
             dropout=cfg.dropout,
         )
-        trans_m = fit_regression_model(
-            trans_m,
+        itrans = fit_regression_model(
+            itrans,
             train_loader,
             val_loader,
             device,
@@ -658,28 +866,61 @@ def main() -> None:
             lr=cfg.baseline_lr,
             patience=cfg.baseline_early_stop_patience,
             grad_clip_max_norm=cfg.baseline_grad_clip_max_norm,
-            name="Plain Transformer",
+            name="iTransformer",
         )
 
-        def wrap_tr(h):
-            return trans_m(h)
+        def wrap_itr(h):
+            return itrans(h)
 
-        mse_b, mae_b = eval_forecasts_mse_mae(wrap_tr, test_loader, device)
-        mt_b, at_b = eval_channel_mse_mae(wrap_tr, test_loader, device, t_idx)
-        print_baseline_block(
-            "Plain Transformer", mse_b, mae_b, mt_b, at_b, temp_name, n_features
-        )
-        horizon_maes["Plain Transformer"] = eval_horizon_mae(
-            lambda h, f: trans_m(h),
+        mse_b, mae_b = eval_forecasts_mse_mae(wrap_itr, test_loader, device)
+        mt_b, at_b = eval_channel_mse_mae(wrap_itr, test_loader, device, t_idx)
+        print_baseline_block("iTransformer", mse_b, mae_b, mt_b, at_b, temp_name, n_features)
+        horizon_maes["iTransformer"] = eval_horizon_mae(
+            lambda h, f: itrans(h),
             test_loader,
             device,
             cfg.pred_len,
             t_idx,
             n_features,
         )
-        bar_names.append("Plain Transformer")
+        bar_names.append("iTransformer")
         bar_maes.append(float(at_b))
         bar_mses.append(float(mt_b))
+        itrans_mse, itrans_mae = float(mt_b), float(at_b)
+
+        print(
+            "\n--- 扩散主对比（mr-Diff / SimDiff(基线) / Improved；缺权重已跳过，见上 [hint]）---"
+        )
+        for lab, mm in paper_stack:
+            _mse_b, _mae_b, mae_chx, mse_chx = evaluate_test_loader(
+                mm, test_loader, device, n_features
+            )
+            print(
+                f"  [{lab}] {temp_name} MSE={float(mse_chx[t_idx]):.6f} | "
+                f"MAE={float(mae_chx[t_idx]):.6f}"
+            )
+            horizon_maes[lab] = eval_horizon_mae(
+                lambda h, f, mmm=mm: point_prediction_from_forecast(
+                    mmm.forecast(h, future=f), mmm.cfg
+                ),
+                test_loader,
+                device,
+                cfg.pred_len,
+                t_idx,
+                n_features,
+            )
+            bar_names.append(lab)
+            bar_maes.append(float(mae_chx[t_idx]))
+            bar_mses.append(float(mse_chx[t_idx]))
+
+        r_dl = collect_channel_residuals(wrap_dl, test_loader, device, t_idx)
+        residual_multi_for_kde = {"DLinear": r_dl}
+        for lab, mm in paper_stack:
+            r_k, _ = collect_test_forecast_errors(mm, test_loader, device, t_idx)
+            residual_multi_for_kde[lab] = r_k
+        if wrap_lstm is not None and lstm_m is not None:
+            r_ls = collect_channel_residuals(wrap_lstm, test_loader, device, t_idx)
+            residual_multi_for_kde["LSTM"] = r_ls
 
         yt, yp = collect_pooled_predictions(
             lambda h, f: point_prediction_from_forecast(
@@ -689,65 +930,79 @@ def main() -> None:
             device,
             t_idx,
         )
-        p_sc = plot_dir / "scatter_simdiff_pred_vs_true.png"
-        plot_pred_vs_true_scatter(
-            p_sc,
-            yt,
-            yp,
-            title=f"{_sdn}: predicted vs true ({temp_name})",
-        )
-        print(f"Saved plot: {p_sc}")
+        if do_plots:
+            p_sc = plot_dir / "scatter_simdiff_pred_vs_true.png"
+            plot_pred_vs_true_scatter(
+                p_sc,
+                yt,
+                yp,
+                title=f"{_sdn}: predicted vs true ({temp_name})",
+            )
+            print(f"Saved plot: {p_sc}")
 
         hist_b, fut_b = next(iter(test_loader))
         hist_b = hist_b.to(device)
         fut_b = fut_b.to(device)
         with torch.no_grad():
-            preds_np: dict[str, np.ndarray] = {
-                _sdn: point_prediction_from_forecast(
-                    model.forecast(hist_b, future=fut_b), model.cfg
-                ).cpu().numpy(),
+            _pd: dict[str, np.ndarray] = {
                 "DLinear": dlm(hist_b).cpu().numpy(),
-                "LSTM": lstm_m(hist_b).cpu().numpy(),
-                "Plain Transformer": trans_m(hist_b).cpu().numpy(),
+                "iTransformer": itrans(hist_b).cpu().numpy(),
             }
-        hist0 = hist_b[0].cpu().numpy()
-        true0 = fut_b[0].cpu().numpy()
-        pred_dict = {k: v[0] for k, v in preds_np.items()}
-        p_cmp = plot_dir / "forecast_compare_example.png"
-        plot_forecast_compare(
-            p_cmp,
-            t_hist,
-            t_fut,
-            hist0,
-            true0,
-            pred_dict,
-            ylabel=ylabel,
-            title=f"Forecast comparison (first test batch sample) — {temp_name}",
-        )
-        print(f"Saved plot: {p_cmp}")
-
-        n_ex = min(4, hist_b.shape[0])
-        grid_ex = []
-        for i in range(n_ex):
-            grid_ex.append(
-                {
-                    "hist": hist_b[i].cpu().numpy(),
-                    "true": fut_b[i].cpu().numpy(),
-                    "preds": {k: preds_np[k][i] for k in preds_np},
-                }
+            for lab, mm in paper_stack:
+                _pd[lab] = point_prediction_from_forecast(
+                    mm.forecast(hist_b, future=fut_b), mm.cfg
+                ).cpu().numpy()
+            if lstm_m is not None:
+                _pd["LSTM"] = lstm_m(hist_b).cpu().numpy()
+            # 图例顺序：DLinear、iTransformer、三扩散、LSTM 置后
+            _plot_order = (
+                "DLinear",
+                "iTransformer",
+                "mr-Diff",
+                "SimDiff",
+                "Improved SimDiff",
+                "LSTM",
             )
-        p_grid = plot_dir / "forecast_compare_grid.png"
-        plot_forecast_grid(
-            p_grid,
-            grid_ex,
-            cfg.seq_len,
-            cfg.pred_len,
-            ylabel=ylabel,
-            title=f"Forecast comparison — {temp_name}",
-        )
-        print(f"Saved plot: {p_grid}")
+            preds_np = {k: _pd[k] for k in _plot_order if k in _pd}
+        if do_plots:
+            hist0 = hist_b[0].cpu().numpy()
+            true0 = fut_b[0].cpu().numpy()
+            pred_dict = {k: v[0] for k, v in preds_np.items()}
+            p_cmp = plot_dir / "forecast_compare_example.png"
+            plot_forecast_compare(
+                p_cmp,
+                t_hist,
+                t_fut,
+                hist0,
+                true0,
+                pred_dict,
+                ylabel=ylabel,
+                title=f"Forecast comparison (first test batch sample) — {temp_name}",
+            )
+            print(f"Saved plot: {p_cmp}")
 
-    if not args.skip_error_kde:
+            n_ex = min(4, hist_b.shape[0])
+            grid_ex = []
+            for i in range(n_ex):
+                grid_ex.append(
+                    {
+                        "hist": hist_b[i].cpu().numpy(),
+                        "true": fut_b[i].cpu().numpy(),
+                        "preds": {k: preds_np[k][i] for k in preds_np},
+                    }
+                )
+            p_grid = plot_dir / "forecast_compare_grid.png"
+            plot_forecast_grid(
+                p_grid,
+                grid_ex,
+                cfg.seq_len,
+                cfg.pred_len,
+                ylabel=ylabel,
+                title=f"Forecast comparison — {temp_name}",
+            )
+            print(f"Saved plot: {p_grid}")
+
+    if do_plots and not args.skip_error_kde:
         res_e, ae_e = collect_test_forecast_errors(
             model, test_loader, device, t_idx
         )
@@ -767,58 +1022,94 @@ def main() -> None:
                 p3,
                 residual_multi_for_kde,
                 unit_label=feat_names[t_idx] if t_idx < len(feat_names) else temp_name,
-                title=f"Residual KDE: SimDiff vs DLinear vs LSTM — {temp_name}",
+                title=f"Residual KDE (DLinear, iTransformer, LSTM, 扩散) — {temp_name}",
             )
             print(f"Saved plot: {p3}")
-            print("  （左侧子图为多模型时，error_distribution_kde.png 左栏标题为 Residual (multi-model)）")
+            print("  （左侧子图多模型时，error_distribution_kde.png 左栏为 Residual (multi-model)）")
         else:
             print(
-                "  [hint] 未跑学习型基线：KDE 左栏仅 SimDiff。"
-                "需要三模型对比请不要加 --skip_baselines，并重新运行完整 main.py。"
+                "  [hint] 未跑学习型基线或 residual 为空，KDE 多通道对比受限。"
+                "需要完整主对比请不要加 --skip_baselines 并开 --full_plots。"
             )
 
-    p_metrics = plot_dir / "metrics_comparison_mae_mse.png"
-    plot_metrics_bars(
-        p_metrics,
-        bar_names,
-        bar_maes,
-        bar_mses,
-        title=f"Test metrics — {temp_name}",
-    )
-    print(f"Saved plot: {p_metrics}")
+    if do_plots:
+        p_metrics = plot_dir / "metrics_comparison_mae_mse.png"
+        plot_metrics_bars(
+            p_metrics,
+            bar_names,
+            bar_maes,
+            bar_mses,
+            title=f"Test metrics — {temp_name}",
+        )
+        print(f"Saved plot: {p_metrics}")
 
-    p_h = plot_dir / "mae_by_horizon.png"
-    plot_horizon_mae(
-        p_h,
-        horizon_maes,
-        cfg.pred_len,
-        title=f"MAE by horizon — {temp_name}",
-    )
-    print(f"Saved plot: {p_h}")
+        p_h = plot_dir / "mae_by_horizon.png"
+        plot_horizon_mae(
+            p_h,
+            horizon_maes,
+            cfg.pred_len,
+            title=f"MAE by horizon — {temp_name}",
+        )
+        print(f"Saved plot: {p_h}")
 
-    hist, fut = next(iter(test_loader))
-    hist = hist.to(device)
-    fut = fut.to(device)
-    with torch.no_grad():
-        fo = model.forecast(hist[:1], future=fut[:1])
-    hist0 = hist[0].cpu().numpy()
-    true0 = fut[0].cpu().numpy()
-    pred0 = point_prediction_from_forecast(fo, cfg)[0].cpu().numpy()
+        hist, fut = next(iter(test_loader))
+        hist = hist.to(device)
+        fut = fut.to(device)
+        with torch.no_grad():
+            fo = model.forecast(hist[:1], future=fut[:1])
+        hist0 = hist[0].cpu().numpy()
+        true0 = fut[0].cpu().numpy()
+        pred0 = point_prediction_from_forecast(fo, cfg)[0].cpu().numpy()
 
-    plt.figure(figsize=(10, 4))
-    plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
-    plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="C1")
-    plt.plot(t_fut, pred0[:, c_vis], label=_sdn, color="C2", linestyle="--")
-    plt.axvline(cfg.seq_len - 0.5, color="gray", linestyle=":")
-    plt.xlabel("time step (index)")
-    plt.ylabel(ylabel)
-    plt.title("SimDiff-Weather: forecast (single model)")
-    plt.legend()
-    plt.tight_layout()
-    plot_path = plot_dir / "forecast_example.png"
-    plt.savefig(plot_path, dpi=150)
-    plt.close()
-    print(f"Saved plot: {plot_path}")
+        plt.figure(figsize=(10, 4))
+        plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
+        plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="C1")
+        plt.plot(t_fut, pred0[:, c_vis], label=_sdn, color="C2", linestyle="--")
+        plt.axvline(cfg.seq_len - 0.5, color="gray", linestyle=":")
+        plt.xlabel("time step (index)")
+        plt.ylabel(ylabel)
+        plt.title("SimDiff-Weather: forecast (single model)")
+        plt.legend()
+        plt.tight_layout()
+        plot_path = plot_dir / "forecast_example.png"
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"Saved plot: {plot_path}")
+    else:
+        print("（未开 --full_plots：不写入 plot_dir 下散点/对比/指标/单窗预报等图）")
+
+    if bool(getattr(args, "print_result_json", False)):
+        rec = {
+            "data_preset": str(cfg.data_preset),
+            "pred_len": int(cfg.pred_len),
+            "seq_len": int(cfg.seq_len),
+            "model": simdiff_plot_name(cfg),
+            "target_mse": float(mse_ch[t_idx]),
+            "target_mae": float(mae_ch[t_idx]),
+        }
+        print("RESULT_JSON " + json.dumps(rec, ensure_ascii=False))
+
+    _mdir = getattr(args, "save_run_metrics_dir", None)
+    if _mdir:
+        mdir = Path(_mdir)
+        mdir.mkdir(parents=True, exist_ok=True)
+        tag = cfg.simdiff_checkpoint_tag()
+        mrec: dict = {
+            "data_preset": str(cfg.data_preset),
+            "pred_len": int(cfg.pred_len),
+            "seq_len": int(cfg.seq_len),
+            "checkpoint_tag": tag,
+            "diffusion_label": simdiff_plot_name(cfg),
+            "diffusion_mse": float(mse_ch[t_idx]),
+            "diffusion_mae": float(mae_ch[t_idx]),
+            "DLinear_mse": dlinear_mse,
+            "DLinear_mae": dlinear_mae,
+            "iTransformer_mse": itrans_mse,
+            "iTransformer_mae": itrans_mae,
+        }
+        mpath = mdir / f"{cfg.data_preset}_p{cfg.pred_len}_{tag}.json"
+        mpath.write_text(json.dumps(mrec, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"已保存本 run 指标: {mpath}")
 
 
 if __name__ == "__main__":

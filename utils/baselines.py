@@ -122,6 +122,50 @@ class BaselineTransformer(nn.Module):
         return self.out_proj(fut_part)
 
 
+class ITransformer(nn.Module):
+    """
+    iTransformer 风格：在**变量维** C 上执行 self-attn（(B, C, d) 序列），
+    每变量用 Linear(seq_len, d) 从完整历史上嵌入。单变量 (C=1) 时退化为该嵌入+FFN。
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        pred_len: int,
+        channels: int,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError("d_model 须能整除 nhead")
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.channels = channels
+        self.d_model = d_model
+        self.in_proj = nn.Linear(seq_len, d_model)
+        enc = nn.TransformerEncoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.enc = nn.TransformerEncoder(enc, num_layers)
+        self.out_proj = nn.Linear(d_model, pred_len)
+
+    def forward(self, hist: torch.Tensor) -> torch.Tensor:
+        x = hist.permute(0, 2, 1)
+        v = self.in_proj(x)
+        e = self.enc(v)
+        o = self.out_proj(e)
+        return o.permute(0, 2, 1)
+
+
 @torch.no_grad()
 def _val_mse(model: nn.Module, val_loader: torch.utils.data.DataLoader, device: torch.device) -> float:
     model.eval()

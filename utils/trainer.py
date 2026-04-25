@@ -33,6 +33,13 @@ def _config_to_meta(cfg: Config) -> dict:
         "seq_len": cfg.seq_len,
         "pred_len": cfg.pred_len,
         "input_dim": cfg.input_dim,
+        "data_preset": getattr(cfg, "data_preset", None),
+        "use_patch": getattr(cfg, "use_patch", False),
+        "use_rope": getattr(cfg, "use_rope", False),
+        "patch_size": getattr(cfg, "patch_size", None),
+        "patch_stride": getattr(cfg, "patch_stride", None),
+        "mrdiff_denoiser": getattr(cfg, "mrdiff_denoiser", False),
+        "infer_fp16": getattr(cfg, "infer_fp16", False),
     }
     if cfg.train_future_marginal_mean is not None:
         meta["train_future_marginal_mean"] = np.asarray(

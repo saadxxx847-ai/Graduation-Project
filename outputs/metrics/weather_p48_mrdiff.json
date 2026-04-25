@@ -1,0 +1,13 @@
+{
+  "data_preset": "weather",
+  "pred_len": 48,
+  "seq_len": 96,
+  "checkpoint_tag": "mrdiff",
+  "diffusion_label": "mr-Diff",
+  "diffusion_mse": 1.0234044790267944,
+  "diffusion_mae": 0.6771613359451294,
+  "DLinear_mse": 3.0807552450681834,
+  "DLinear_mae": 1.2197662877082251,
+  "iTransformer_mse": 3.3083321994741195,
+  "iTransformer_mae": 1.2849669855791588
+}

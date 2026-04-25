@@ -6,6 +6,7 @@ SimDiff-Weather：Normalization Independence + Median-of-Means 集成预测。
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -13,8 +14,16 @@ import torch.nn as nn
 
 from config.config import Config
 from models.diffusion import GaussianDiffusion
+from models.mr_denoiser import MrDenoiser
 from models.network import DenoiserTransformer
 from utils.independent_normalizer import IndependentNormalizer, mom_aggregate_normalized
+
+
+def _infer_autocast(cfg: Config, device: torch.device):
+    """预测/采样时在 GPU 上半精度加速；CPU 或非 fp16 配置下不启用。"""
+    if device.type != "cuda" or not bool(getattr(cfg, "infer_fp16", False)):
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.float16)
 
 
 def point_prediction_from_forecast(out: ForecastOutput, cfg: Config) -> torch.Tensor:
@@ -45,15 +54,32 @@ class SimDiffWeather(nn.Module):
             raise ValueError("请先运行 make_loaders 以写入 train_future_marginal_mean/std")
 
         self.cfg = cfg
-        self.net = DenoiserTransformer(
-            cfg.seq_len,
-            cfg.pred_len,
-            cfg.input_dim,
-            cfg.d_model,
-            cfg.n_heads,
-            cfg.n_layers,
-            cfg.dropout,
-        )
+        if getattr(cfg, "mrdiff_denoiser", False):
+            self.net = MrDenoiser(
+                cfg.seq_len,
+                cfg.pred_len,
+                cfg.input_dim,
+                cfg.d_model,
+                cfg.n_heads,
+                cfg.n_layers,
+                cfg.dropout,
+            )
+        else:
+            ps = int(cfg.patch_size)
+            st = cfg.patch_stride
+            self.net = DenoiserTransformer(
+                cfg.seq_len,
+                cfg.pred_len,
+                cfg.input_dim,
+                cfg.d_model,
+                cfg.n_heads,
+                cfg.n_layers,
+                cfg.dropout,
+                use_patch=bool(cfg.use_patch),
+                patch_size=ps,
+                patch_stride=st,
+                use_rope=bool(cfg.use_rope),
+            )
         self.diffusion = GaussianDiffusion(cfg.timesteps, cfg.cosine_s)
         self._sample_clamp_abs = float(cfg.z_clip) + 2.0
 
@@ -117,20 +143,21 @@ class SimDiffWeather(nn.Module):
         device = hist_n.device
         b = hist_n.shape[0]
         hist_rep = hist_n.repeat_interleave(k, dim=0)
-        fut_flat = self.diffusion.sample(
-            self.net,
-            hist_rep,
-            self.cfg.pred_len,
-            self.cfg.input_dim,
-            device,
-            clamp_abs=self._sample_clamp_abs,
-            sampling_mode=self.cfg.sampling_mode,
-            sampling_steps=self.cfg.sampling_steps,
-            ddim_eta=float(self.cfg.ddim_eta),
-            clip_pred_x0=bool(self.cfg.sample_clip_pred_x0),
-            sample_debug=bool(self.cfg.sample_debug),
-            sample_debug_every=int(self.cfg.sample_debug_every),
-        )
+        with _infer_autocast(self.cfg, device):
+            fut_flat = self.diffusion.sample(
+                self.net,
+                hist_rep,
+                self.cfg.pred_len,
+                self.cfg.input_dim,
+                device,
+                clamp_abs=self._sample_clamp_abs,
+                sampling_mode=self.cfg.sampling_mode,
+                sampling_steps=self.cfg.sampling_steps,
+                ddim_eta=float(self.cfg.ddim_eta),
+                clip_pred_x0=bool(self.cfg.sample_clip_pred_x0),
+                sample_debug=bool(self.cfg.sample_debug),
+                sample_debug_every=int(self.cfg.sample_debug_every),
+            )
         lf, c = self.cfg.pred_len, self.cfg.input_dim
         stacked = fut_flat.reshape(b, k, lf, c)
         return stacked
@@ -151,22 +178,23 @@ class SimDiffWeather(nn.Module):
         b0 = hist[:1]
         hist_n, st_h = IndependentNormalizer.normalize_history(b0)
         hist_n = self._clip_z(hist_n)
-        _out = self.diffusion.sample(
-            self.net,
-            hist_n,
-            self.cfg.pred_len,
-            self.cfg.input_dim,
-            device,
-            clamp_abs=self._sample_clamp_abs,
-            sampling_mode=self.cfg.sampling_mode,
-            sampling_steps=self.cfg.sampling_steps,
-            ddim_eta=float(self.cfg.ddim_eta),
-            clip_pred_x0=bool(self.cfg.sample_clip_pred_x0),
-            sample_debug=False,
-            sample_debug_every=int(self.cfg.sample_debug_every),
-            return_trajectory=True,
-            trajectory_max_points=mp,
-        )
+        with _infer_autocast(self.cfg, device):
+            _out = self.diffusion.sample(
+                self.net,
+                hist_n,
+                self.cfg.pred_len,
+                self.cfg.input_dim,
+                device,
+                clamp_abs=self._sample_clamp_abs,
+                sampling_mode=self.cfg.sampling_mode,
+                sampling_steps=self.cfg.sampling_steps,
+                ddim_eta=float(self.cfg.ddim_eta),
+                clip_pred_x0=bool(self.cfg.sample_clip_pred_x0),
+                sample_debug=False,
+                sample_debug_every=int(self.cfg.sample_debug_every),
+                return_trajectory=True,
+                trajectory_max_points=mp,
+            )
         _, traj_norm = _out
         if self.cfg.simdiff_ablation == "mom_only":
             mu_inv, sig_inv = st_h["mu_h"], st_h["sig_h"]

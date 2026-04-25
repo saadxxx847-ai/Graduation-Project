@@ -1,0 +1,13 @@
+{
+  "data_preset": "etth1",
+  "pred_len": 48,
+  "seq_len": 96,
+  "checkpoint_tag": "mrdiff",
+  "diffusion_label": "mr-Diff",
+  "diffusion_mse": 2.451885461807251,
+  "diffusion_mae": 1.1791486740112305,
+  "DLinear_mse": 5.615775248621478,
+  "DLinear_mae": 1.8063743889894885,
+  "iTransformer_mse": 6.104956017621616,
+  "iTransformer_mae": 1.9746445237544545
+}

@@ -11,12 +11,19 @@ from typing import Any
 @dataclass
 class Config:
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
+    # weather | etth1 | ettm1 | exchange | wind；设置后会覆盖 data_path / 目标列
+    data_preset: str = "weather"
     data_path: str = "data/weather.csv"
-    # True：只保留气温一列（毕设单变量预测）；False：使用 CSV 全部数值列
+    # 当不是 preset 时：按列名或列下标选取单变量；None=weather 用气温列
+    target_column: str | None = None
+    # True：只保留单目标列；False：使用 CSV 全部数值列（多变量，指标仍用 target 通道）
+    univariate: bool = True
+    # True：只保留气温一列（兼容旧名；univariate+weather 时优先用气温解析）
     temperature_only: bool = True
     processed_dir: str = "data/processed"
     checkpoint_dir: str = "checkpoints"
-    plot_dir: str = "plots"
+    # 诊断图（--full_plots）单独放子目录，避免与论文 outputs/paper 下分类图混淆
+    plot_dir: str = "plots/diagnostics"
 
     seq_len: int = 96
     pred_len: int = 24
@@ -28,6 +35,14 @@ class Config:
     n_heads: int = 4
     n_layers: int = 3
     dropout: float = 0.1
+    # Patch / RoPE（改进版；二者均关 = 与论文 SimDiff/基线 对齐）
+    use_patch: bool = False
+    use_rope: bool = False
+    patch_size: int = 8
+    # None 表示与 patch_size 相同（不重叠时 stride=patch_size；重叠时改小）
+    patch_stride: int | None = None
+    # True：用 1D 卷积去噪网（作为 mr-Diff 对照，与下面 mrdiff 同义）
+    mrdiff_denoiser: bool = False
 
     timesteps: int = 200
     cosine_s: float = 5.0
@@ -45,8 +60,9 @@ class Config:
     training_noise_temporal_diff_weight: float = 0.05
 
     batch_size: int = 64
-    learning_rate: float = 5e-5
-    epochs: int = 50
+    # 扩散训练常用较小 lr；若 loss 发散可改回 1e-4～5e-5
+    learning_rate: float = 0.003
+    epochs: int = 30
     num_workers: int = 0
     seed: int = 42
     early_stop_patience: int = 10
@@ -54,9 +70,11 @@ class Config:
     z_clip: float = 4.0
 
     device: str = "cuda"
+    # True：仅 forecast / 采样在 CUDA 上用 autocast float16，加快推理；训练仍为 float32
+    infer_fp16: bool = True
 
     # DLinear / LSTM / Plain Transformer：与 SimDiff 同数据划分，在验证集 MSE 上早停
-    baseline_max_epochs: int = 50
+    baseline_max_epochs: int = 30
     baseline_early_stop_patience: int = 10
     baseline_lr: float = 1e-3
     baseline_grad_clip_max_norm: float = 1.0
@@ -106,15 +124,45 @@ class Config:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    def simdiff_checkpoint_filename(self) -> str:
+    def simdiff_checkpoint_tag(self) -> str:
+        if self.mrdiff_denoiser or getattr(self, "_force_tag_mrdiff", False):
+            return "mrdiff"
         if self.simdiff_ablation == "mom_only":
-            return "simdiff_weather_best_mom_only.pt"
-        return "simdiff_weather_best.pt"
+            return "mom_only"
+        if self.use_patch and self.use_rope:
+            return "ours"
+        if self.use_patch:
+            return "patch"
+        if self.use_rope:
+            return "rope"
+        return "simdiff"
+
+    def simdiff_checkpoint_filename(self) -> str:
+        ds = (self.data_preset or "custom").lower().replace(" ", "_")
+        pl = int(self.pred_len)
+        tag = self.simdiff_checkpoint_tag()
+        if self.simdiff_ablation == "mom_only" and tag == "mom_only":
+            return f"simdiff_{ds}_p{pl}_mom_only.pt"
+        if self.mrdiff_denoiser or getattr(self, "_force_tag_mrdiff", False):
+            return f"mrDiff_{ds}_p{pl}.pt"
+        return f"simdiff_{ds}_p{pl}_{tag}.pt"
 
     def validate_simdiff_ablation(self) -> None:
         allowed = ("full", "ni_only", "mom_only")
         if self.simdiff_ablation not in allowed:
             raise ValueError(f"simdiff_ablation 须为 {allowed}，当前为 {self.simdiff_ablation!r}")
+
+    def validate_arch(self) -> None:
+        if getattr(self, "mrdiff_denoiser", False):
+            return
+        if not bool(getattr(self, "use_rope", False)):
+            return
+        dh = int(self.d_model) // int(self.n_heads)
+        if dh % 2 != 0:
+            raise ValueError(
+                f"使用 RoPE 时要求 d_model//n_heads 为偶数，当前 d_model={self.d_model} "
+                f"n_heads={self.n_heads} -> d_h={dh}"
+            )
 
     def validate_mom_config(self) -> None:
         k, m = int(self.forecast_num_samples), int(self.mom_num_groups)
