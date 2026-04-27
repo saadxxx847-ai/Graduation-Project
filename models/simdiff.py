@@ -53,6 +53,8 @@ class SimDiffWeather(nn.Module):
             cfg.n_heads,
             cfg.n_layers,
             cfg.dropout,
+            use_revin=bool(cfg.use_revin),
+            use_rmsnorm=bool(cfg.use_rmsnorm),
         )
         self.diffusion = GaussianDiffusion(cfg.timesteps, cfg.cosine_s)
         self._sample_clamp_abs = float(cfg.z_clip) + 2.0
@@ -130,6 +132,7 @@ class SimDiffWeather(nn.Module):
             clip_pred_x0=bool(self.cfg.sample_clip_pred_x0),
             sample_debug=bool(self.cfg.sample_debug),
             sample_debug_every=int(self.cfg.sample_debug_every),
+            inference_fp16=bool(self.cfg.forecast_amp),
         )
         lf, c = self.cfg.pred_len, self.cfg.input_dim
         stacked = fut_flat.reshape(b, k, lf, c)
@@ -166,6 +169,7 @@ class SimDiffWeather(nn.Module):
             sample_debug_every=int(self.cfg.sample_debug_every),
             return_trajectory=True,
             trajectory_max_points=mp,
+            inference_fp16=bool(self.cfg.forecast_amp),
         )
         _, traj_norm = _out
         if self.cfg.simdiff_ablation == "mom_only":
@@ -189,7 +193,7 @@ class SimDiffWeather(nn.Module):
         return_samples: bool = False,
     ) -> ForecastOutput:
         """
-        推理：K 次采样 → MoM（M 组组均值的中位数）+ 单次与全均值。
+        推理：K 次采样 → MoM（M 组组均值的中位数，可与低温加权凸组合）+ 单次与全均值。
         future 可选；评估时传入真值以便用本窗 μ_f,σ_f 反变换（模型仍只消费 hist）。
         return_samples=True 时额外返回 samples (B,K,Lf,C) 原始尺度，用于 CRPS / 预测区间。
         """
@@ -206,7 +210,12 @@ class SimDiffWeather(nn.Module):
         hist_n = self._clip_z(hist_n)
 
         stacked = self._sample_k_trajectories_norm(hist_n, k)
-        single_n, mean_n, mom_n = mom_aggregate_normalized(stacked, m)
+        single_n, mean_n, mom_n = mom_aggregate_normalized(
+            stacked,
+            m,
+            cold_bias_blend=float(self.cfg.mom_cold_bias_blend),
+            cold_sharpness=float(self.cfg.mom_cold_sharpness),
+        )
 
         if self.cfg.simdiff_ablation == "mom_only":
             mu_inv, sig_inv = st_h["mu_h"], st_h["sig_h"]

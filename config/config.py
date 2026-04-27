@@ -17,6 +17,10 @@ class Config:
     processed_dir: str = "data/processed"
     checkpoint_dir: str = "checkpoints"
     plot_dir: str = "plots"
+    # 毕设结果图根目录；其下按数据集自动分子目录（见 resolved_result_dir），多数据集互不覆盖
+    result_dir: str = "result"
+    # True：只写 result/<数据集>/ 与终端指标表，不保存 plots/ 下任何图（毕设精简输出）
+    thesis_result_only: bool = True
 
     seq_len: int = 96
     pred_len: int = 24
@@ -28,6 +32,11 @@ class Config:
     n_heads: int = 4
     n_layers: int = 3
     dropout: float = 0.1
+    # 去噪器结构：与数据层 NI（IndependentNormalizer）正交
+    # True：嵌入后、注意力前对 (B,L,d) 做 RevIn，encoder 出未来段后再反归一
+    # True：自注意力+FFN 的预归一化用 RMSNorm 替代 nn.TransformerEncoder 内的 LayerNorm
+    use_revin: bool = True
+    use_rmsnorm: bool = True
 
     timesteps: int = 200
     cosine_s: float = 5.0
@@ -45,30 +54,38 @@ class Config:
     training_noise_temporal_diff_weight: float = 0.05
 
     batch_size: int = 64
-    learning_rate: float = 5e-5
-    epochs: int = 50
+    learning_rate: float = 3e-4
+    # 若 MAE 仍高于基线：可试 50~80、lr 2e-4，或增大 d_model / n_layers（须删 ckpt 重训）
+    epochs: int = 35
     num_workers: int = 0
     seed: int = 42
-    early_stop_patience: int = 10
+    early_stop_patience: int = 8
     grad_clip_max_norm: float = 0.5
     z_clip: float = 4.0
 
     device: str = "cuda"
+    # SimDiff 推理/采样/评估 forecast：在 CUDA 上用 autocast(float16) 加速（非训练循环）
+    forecast_amp: bool = True
 
-    # DLinear / LSTM / Plain Transformer：与 SimDiff 同数据划分，在验证集 MSE 上早停
-    baseline_max_epochs: int = 50
+    # iTransformer：max_epochs 与 SimDiff 相同，均为 cfg.epochs（含 --epochs）。TimeMixer 单独上限见下。
     baseline_early_stop_patience: int = 10
+    baseline_timemixer_max_epochs: int = 45
     baseline_lr: float = 1e-3
+    # 仅 TimeMixer；为 None 时用 baseline_lr（略降如 5e-4 有时更稳）
+    baseline_timemixer_lr: float | None = None
     baseline_grad_clip_max_norm: float = 1.0
-    baseline_transformer_d_model: int = 128
-    baseline_transformer_nhead: int = 4
-    baseline_transformer_layers: int = 3
-    baseline_lstm_hidden: int = 128
-    baseline_lstm_layers: int = 2
+    baseline_timemixer_d_model: int = 128
+    baseline_timemixer_scales: int = 3
+    baseline_itransformer_d_model: int = 128
+    baseline_itransformer_nhead: int = 4
+    baseline_itransformer_layers: int = 2
 
     # MoM：K 次独立采样 → 分 M 组组内均值 → M 个均值再逐元中位数
     forecast_num_samples: int = 20
     mom_num_groups: int = 5
+    # 与标准 MoM 凸组合：在归一化空间对「组均值更低」的分组加大权重，减轻冷尾被抹平；0=纯中位数
+    mom_cold_bias_blend: float = 0.25
+    mom_cold_sharpness: float = 2.0
 
     # SimDiff 消融：full=NI+MoM；ni_only=保留 NI，评估用 K 次算术均值（无 MoM），与 full 共用权重；
     # mom_only=未来用历史窗 μ_h,σ_h 归一化（非 NI）+ MoM，需单独训练，见 simdiff_checkpoint_filename()
@@ -106,6 +123,16 @@ class Config:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    def result_dataset_slug(self) -> str:
+        """由 data_path 文件名生成子目录名，如 data/weather.csv -> weather。"""
+        return self.resolved_data_path().stem
+
+    def resolved_result_dir(self) -> Path:
+        """毕设图表输出目录：result/<slug>/，换数据集时改 data_path 即可隔离。"""
+        p = self.project_root / self.result_dir / self.result_dataset_slug()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
     def simdiff_checkpoint_filename(self) -> str:
         if self.simdiff_ablation == "mom_only":
             return "simdiff_weather_best_mom_only.pt"
@@ -124,3 +151,8 @@ class Config:
             raise ValueError("K=1 时 MoM 分组数必须为 1")
         if k > 1 and k % m != 0:
             raise ValueError(f"forecast_num_samples={k} 必须能被 mom_num_groups={m} 整除")
+        b = float(self.mom_cold_bias_blend)
+        if not 0.0 <= b <= 1.0:
+            raise ValueError(f"mom_cold_bias_blend 须在 [0,1]，当前为 {b!r}")
+        if float(self.mom_cold_sharpness) < 0.0:
+            raise ValueError("mom_cold_sharpness 必须 >= 0")

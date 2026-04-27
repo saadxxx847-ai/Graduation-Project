@@ -4,11 +4,18 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _inference_ctx(device: torch.device, use_fp16: bool):
+    if use_fp16 and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+    return nullcontext()
 
 
 def _trajectory_save_indices(n_inner_steps: int, max_points: int) -> set[int]:
@@ -120,6 +127,7 @@ class GaussianDiffusion(nn.Module):
         hist: torch.Tensor,
         clamp_abs: float = 6.0,
         clip_pred_x0: bool = True,
+        inference_fp16: bool = False,
     ) -> torch.Tensor:
         """DDPM 单步反向采样；对 pred_x0 裁剪再算后验均值，减轻与 DDIM 类似的数值发散。"""
         b = x.shape[0]
@@ -130,7 +138,8 @@ class GaussianDiffusion(nn.Module):
         alpha_t = 1.0 - beta_t
         sqrt_one_minus_ab = self.sqrt_one_minus_alphas_cumprod[t]
         sqrt_alpha_bar = self.sqrt_alphas_cumprod[t]
-        eps_theta = model(x, t_b, hist)
+        with _inference_ctx(device, inference_fp16):
+            eps_theta = model(x, t_b, hist)
 
         pred_x0 = (x - sqrt_one_minus_ab * eps_theta) / sqrt_alpha_bar.clamp(min=1e-8)
         if clip_pred_x0:
@@ -159,13 +168,15 @@ class GaussianDiffusion(nn.Module):
         eta: float,
         clamp_abs: float,
         clip_pred_x0: bool,
+        inference_fp16: bool = False,
     ) -> torch.Tensor:
         """单步 DDIM：从离散时间 t 到更小的 t_prev（含 t_prev=0）。"""
         b = x.shape[0]
         device = x.device
         dtype = x.dtype
         t_b = torch.full((b,), t, device=device, dtype=torch.long)
-        eps = model(x, t_b, hist)
+        with _inference_ctx(device, inference_fp16):
+            eps = model(x, t_b, hist)
 
         alpha_t = self.alphas_cumprod[t].to(device=device, dtype=dtype)
         alpha_prev = self.alphas_cumprod[t_prev].to(device=device, dtype=dtype)
@@ -216,6 +227,7 @@ class GaussianDiffusion(nn.Module):
         sample_debug_every: int = 20,
         return_trajectory: bool = False,
         trajectory_max_points: int = 36,
+        inference_fp16: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """从纯高斯噪声反向采样得到归一化空间中的未来序列；末尾 clamp 与训练时 z_clip 同量级，减轻未收敛时的爆炸。
         return_trajectory=True 时返回 (x_final, traj)，traj[0] 为初始噪声，其后为沿反向过程子采样快照（同 x 形状）。"""
@@ -248,6 +260,7 @@ class GaussianDiffusion(nn.Module):
                     float(ddim_eta),
                     clamp_abs,
                     clip_pred_x0,
+                    inference_fp16,
                 )
                 if sample_debug and (
                     i % max(1, sample_debug_every) == 0 or i == len(pairs) - 1
@@ -276,6 +289,7 @@ class GaussianDiffusion(nn.Module):
                 hist,
                 clamp_abs=clamp_abs,
                 clip_pred_x0=clip_pred_x0,
+                inference_fp16=inference_fp16,
             )
             x = x.clamp(-clamp_abs, clamp_abs)
             if sample_debug and (

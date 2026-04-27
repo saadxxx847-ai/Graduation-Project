@@ -1,16 +1,27 @@
 """
-简单确定性基线：persistence、滑动均值、DLinear、LSTM、Plain Transformer；
+基线：iTransformer（精简倒置注意力）、TimeMixer（精简化多尺度混合）、DLinear、LSTM、Transformer 等；
 与 SimDiff 共用原始尺度 (hist, fut)，在验证集 MSE 上早停训练。
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from collections.abc import Callable
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
+
+
+def forecast_amp_context(device: torch.device, use_fp16: bool):
+    """
+    预测/评估前向用半精度（仅 CUDA 可靠加速）；CPU 或无 fp16 时退化为无操作。
+    """
+    if not use_fp16 or device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
 
 
 @torch.no_grad()
@@ -44,6 +55,78 @@ class DLinearMap(nn.Module):
         x = hist.reshape(b, lh * c)
         y = self.lin(x)
         return y.reshape(b, self.pred_len, c)
+
+
+class BaselineTimeMixer(nn.Module):
+    """
+    TimeMixer 风格多尺度时序混合基线（精简化，非官方仓库逐行复现）。
+
+    对历史 (B, L, C) 做通道嵌入，多时间尺度平均池化后分别过 MLP 混合、再插值回 L，
+    拼接融合后经时间平均池化与线性头得到 (B, Lf, C)。
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        pred_len: int,
+        channels: int,
+        d_model: int = 128,
+        n_scales: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if n_scales < 1:
+            raise ValueError("n_scales 须 >= 1")
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.channels = channels
+        self.d_model = d_model
+        self.n_scales = n_scales
+        self.tail_steps = 24
+        self.embed = nn.Linear(channels, d_model)
+        self.mix = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(d_model),
+                    nn.Linear(d_model, d_model * 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_model * 2, d_model),
+                )
+                for _ in range(n_scales)
+            ]
+        )
+        self.fuse = nn.Linear(n_scales * d_model, d_model)
+        pool_dim = 2 * d_model
+        self.head = nn.Sequential(
+            nn.Linear(pool_dim, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, pred_len * channels),
+        )
+
+    def forward(self, hist: torch.Tensor) -> torch.Tensor:
+        b, l, c = hist.shape
+        x = self.embed(hist)
+        out_br: list[torch.Tensor] = []
+        for i in range(self.n_scales):
+            target = max(1, l // (2**i))
+            if target == l:
+                y = x
+            else:
+                y = F.adaptive_avg_pool1d(x.transpose(1, 2), target).transpose(1, 2)
+            y = self.mix[i](y)
+            if y.shape[1] != l:
+                y = F.interpolate(
+                    y.transpose(1, 2), size=l, mode="linear", align_corners=False
+                ).transpose(1, 2)
+            out_br.append(y)
+        g = self.fuse(torch.cat(out_br, dim=-1))
+        k = min(self.tail_steps, l)
+        tail_mean = g[:, -k:, :].mean(dim=1)
+        pooled = torch.cat([g[:, -1, :], tail_mean], dim=-1)
+        o = self.head(pooled)
+        return o.reshape(b, self.pred_len, c)
 
 
 class BaselineLSTM(nn.Module):
@@ -120,6 +203,55 @@ class BaselineTransformer(nn.Module):
         out = self.encoder(x)
         fut_part = out[:, lh:, :]
         return self.out_proj(fut_part)
+
+
+class BaselineiTransformer(nn.Module):
+    """
+    精简 iTransformer 风格：变量维为 token，时间维经 Linear(seq_len→d_model) 压入 token；
+    Transformer 沿变量维 C 做自注意力（单变量 C=1 时退化为单 token，仍可做前向）。
+    课程/对照用，非官方仓库逐行复现。
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        pred_len: int,
+        channels: int,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model={d_model} 须能被 nhead={nhead} 整除")
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.channels = channels
+        self.d_model = d_model
+        self.variate_embed = nn.Linear(seq_len, d_model)
+        enc = nn.TransformerEncoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc, num_layers)
+        self.head = nn.Linear(channels * d_model, pred_len * channels)
+
+    def forward(self, hist: torch.Tensor) -> torch.Tensor:
+        b, lh, c = hist.shape
+        if lh != self.seq_len:
+            raise ValueError(f"hist 长度应为 seq_len={self.seq_len}，得到 {lh}")
+        x = hist.transpose(1, 2)
+        x = self.variate_embed(x)
+        x = self.encoder(x)
+        x = x.reshape(b, -1)
+        y = self.head(x)
+        return y.reshape(b, self.pred_len, c)
 
 
 @torch.no_grad()

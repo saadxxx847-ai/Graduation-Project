@@ -28,11 +28,16 @@ def _config_to_meta(cfg: Config) -> dict:
         "training_noise_temporal_diff_weight": cfg.training_noise_temporal_diff_weight,
         "forecast_num_samples": cfg.forecast_num_samples,
         "mom_num_groups": cfg.mom_num_groups,
+        "mom_cold_bias_blend": cfg.mom_cold_bias_blend,
+        "mom_cold_sharpness": cfg.mom_cold_sharpness,
         "simdiff_ablation": cfg.simdiff_ablation,
         "temperature_only": cfg.temperature_only,
         "seq_len": cfg.seq_len,
         "pred_len": cfg.pred_len,
         "input_dim": cfg.input_dim,
+        "use_revin": cfg.use_revin,
+        "use_rmsnorm": cfg.use_rmsnorm,
+        "forecast_amp": cfg.forecast_amp,
     }
     if cfg.train_future_marginal_mean is not None:
         meta["train_future_marginal_mean"] = np.asarray(

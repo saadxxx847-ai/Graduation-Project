@@ -9,6 +9,62 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _y_limits_forecast_focus(
+    hist: np.ndarray,
+    true_fut: np.ndarray,
+    preds: dict[str, np.ndarray],
+    c: int,
+    hist_tail: int = 24,
+) -> tuple[float, float]:
+    """仅用历史末段 + 未来各曲线定 y 轴，避免全长历史把未来段压成「一条线」。"""
+    h = np.asarray(hist[:, c], dtype=np.float64).ravel()
+    tail = h[-min(int(hist_tail), h.size) :]
+    chunks: list[np.ndarray] = [tail, np.asarray(true_fut[:, c], dtype=np.float64).ravel()]
+    for p in preds.values():
+        arr = p[:, c] if p.ndim > 1 else p
+        chunks.append(np.asarray(arr, dtype=np.float64).ravel())
+    seg = np.concatenate(chunks)
+    lo, hi = float(np.min(seg)), float(np.max(seg))
+    pad = 0.04 * max(hi - lo, 1e-6)
+    return lo - pad, hi + pad
+
+
+def _linestyle_for_pred(name: str, i: int) -> tuple[str, str]:
+    """易区分线型：SimDiff 实线，iTransformer 虚线，TimeMixer 点划。"""
+    if name.startswith("SimDiff"):
+        return ("#1f77b4", "-")
+    if name == "iTransformer":
+        return ("#ff7f0e", "--")
+    if name == "TimeMixer":
+        return ("#2ca02c", "-.")
+    return (f"C{i % 10}", ("-", "--", "-.", ":")[i % 4])
+
+
+def _anchor_preds_to_hist_end(
+    hist: np.ndarray,
+    preds: dict[str, np.ndarray],
+    channel: int,
+    enabled: bool,
+) -> dict[str, np.ndarray]:
+    """
+    仅用于绘图：将各模型预测在通道 channel 上整体平移，使首步与 hist[-1,c] 对齐，
+    减轻边界处「陡升/陡降」观感；不改变磁盘上的数值评估（main 中指标仍用原始 pred）。
+    """
+    if not enabled:
+        return preds
+    c = int(channel)
+    out: dict[str, np.ndarray] = {}
+    h_last = float(hist[-1, c])
+    for name, p in preds.items():
+        arr = np.asarray(p, dtype=np.float64).copy()
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        delta = arr[0, c] - h_last
+        arr[:, c] = arr[:, c] - delta
+        out[name] = arr
+    return out
+
+
 def plot_metrics_bars(
     path: Path,
     names: list[str],
@@ -65,28 +121,118 @@ def plot_forecast_compare(
     preds: dict[str, np.ndarray],
     ylabel: str,
     title: str = "Forecast comparison",
+    channel: int = 0,
+    y_zoom_forecast: bool = True,
+    anchor_forecast_boundary: bool = True,
 ) -> None:
     """单窗口：历史 + 真值未来 + 多模型预测（preds 值为 (Lf, C) 已对齐通道）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    c = 0
+    c = int(channel)
     if hist.ndim == 1:
         hist = hist.reshape(-1, 1)
     if true_fut.ndim == 1:
         true_fut = true_fut.reshape(-1, 1)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(t_hist, hist[:, c], label="history", color="black", linewidth=1.2)
-    ax.plot(t_fut, true_fut[:, c], label="ground truth", color="C1", linewidth=2)
-    colors = plt.cm.tab10(np.linspace(0, 0.9, max(len(preds), 1)))
-    for i, (name, p) in enumerate(preds.items()):
+    preds_draw = _anchor_preds_to_hist_end(hist, preds, c, anchor_forecast_boundary)
+    fig, ax = plt.subplots(figsize=(9.5, 3.6))
+    ax.plot(t_hist, hist[:, c], label="history", color="0.2", linewidth=1.0, alpha=0.9)
+    ax.plot(
+        t_fut,
+        true_fut[:, c],
+        label="ground truth",
+        color="black",
+        linewidth=2.0,
+        zorder=4,
+    )
+    for i, (name, p) in enumerate(preds_draw.items()):
         arr = p[:, c] if p.ndim > 1 else p
-        ax.plot(t_fut, arr, linestyle="--", label=name, color=colors[i % 10], linewidth=1.5)
-    ax.axvline(t_hist[-1] + 0.5, color="gray", linestyle=":")
+        arr = np.asarray(arr, dtype=np.float64)
+        col, sty = _linestyle_for_pred(name, i)
+        ax.plot(
+            t_fut,
+            arr,
+            linestyle=sty,
+            label=name,
+            color=col,
+            linewidth=1.55,
+            zorder=3,
+        )
+    ax.axvline(t_hist[-1] + 0.5, color="gray", linestyle=":", linewidth=0.9)
+    if y_zoom_forecast:
+        y0, y1 = _y_limits_forecast_focus(hist, true_fut, preds_draw, c)
+        ax.set_ylim(y0, y1)
     ax.set_xlabel("time step (index)")
     ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    ax.set_title(title, fontsize=10)
+    ax.legend(loc="upper left", fontsize=7, framealpha=0.9)
+    fig.tight_layout(pad=0.4)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_forecast_compare_two_panels(
+    path: Path,
+    t_hist: np.ndarray,
+    t_fut: np.ndarray,
+    panels: list[tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]],
+    ylabel: str,
+    title: str = "Forecast comparison",
+    channel: int = 0,
+    panel_titles: list[str] | None = None,
+    y_zoom_forecast: bool = True,
+    anchor_forecast_boundary: bool = True,
+) -> None:
+    """
+    上下两子图：同一通道下，两个测试窗各一条「历史+真值+多模型未来」。
+    用于与单窗 overlay 图对照（不是「两个表格」——终端只打印一张指标表；文件为一张双面板图）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    c = int(channel)
+    n = len(panels)
+    fig_h = min(2.9 * n + 0.5, 14.0)
+    fig, axes = plt.subplots(n, 1, figsize=(9.0, fig_h), sharex=True, squeeze=False)
+    ax_r = np.atleast_1d(axes).ravel()
+    ptitles = panel_titles or [f"window {i + 1}" for i in range(n)]
+    for j, (ax, (hist, true_fut, preds)) in enumerate(zip(ax_r, panels)):
+        if hist.ndim == 1:
+            hist = hist.reshape(-1, 1)
+        if true_fut.ndim == 1:
+            true_fut = true_fut.reshape(-1, 1)
+        preds_draw = _anchor_preds_to_hist_end(hist, preds, c, anchor_forecast_boundary)
+        ax.plot(
+            t_hist, hist[:, c], label="history", color="0.2", linewidth=0.95, alpha=0.9
+        )
+        ax.plot(
+            t_fut,
+            true_fut[:, c],
+            label="ground truth",
+            color="black",
+            linewidth=1.75,
+            zorder=4,
+        )
+        for i, (name, p) in enumerate(preds_draw.items()):
+            arr = p[:, c] if p.ndim > 1 else p
+            arr = np.asarray(arr, dtype=np.float64)
+            col, sty = _linestyle_for_pred(name, i)
+            ax.plot(
+                t_fut,
+                arr,
+                linestyle=sty,
+                label=name,
+                color=col,
+                linewidth=1.35,
+                zorder=3,
+            )
+        ax.axvline(t_hist[-1] + 0.5, color="gray", linestyle=":", linewidth=0.85)
+        if y_zoom_forecast:
+            y0, y1 = _y_limits_forecast_focus(hist, true_fut, preds_draw, c)
+            ax.set_ylim(y0, y1)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_title(ptitles[j] if j < len(ptitles) else "", fontsize=9)
+        ax.legend(loc="upper left", fontsize=6, ncol=1, framealpha=0.92)
+    ax_r[-1].set_xlabel("time step (index)", fontsize=9)
+    fig.suptitle(title, fontsize=10, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.96), pad=0.5, h_pad=1.0)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -119,7 +265,7 @@ def plot_forecast_grid(
         if tr.ndim == 1:
             tr = tr.reshape(-1, 1)
         ax.plot(t_hist, h[:, c], color="black", linewidth=1.0, label="hist")
-        ax.plot(t_fut, tr[:, c], color="C1", linewidth=1.8, label="true")
+        ax.plot(t_fut, tr[:, c], color="black", linewidth=1.8, label="true")
         for j, (name, p) in enumerate(ex["preds"].items()):
             arr = p[:, c] if p.ndim > 1 else p
             ax.plot(
@@ -173,7 +319,7 @@ def plot_forecast_predictive_intervals(
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(t_hist, hist[:, channel], color="black", linewidth=1.1, label="history")
-    ax.plot(t_fut, true_fut[:, channel], color="C1", linewidth=2.0, label="ground truth")
+    ax.plot(t_fut, true_fut[:, channel], color="black", linewidth=2.0, label="ground truth")
     ax.fill_between(
         t_fut,
         lo,

@@ -59,6 +59,32 @@ def eval_crps_on_test(
     return mean_crps, per_h
 
 
+@torch.no_grad()
+def mean_pred_sample_variance_on_test(
+    model: torch.nn.Module,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    channel: int,
+) -> float:
+    """
+    SimDiff 在 return_samples=True 下，对单通道求 K 次样本在 (batch, horizon) 上平均的预测方差 Var_k[x_k]。
+    确定性模型无样本，不在此函数使用。
+    """
+    tot = 0.0
+    n = 0
+    for hist, fut in test_loader:
+        hist = hist.to(device)
+        fut = fut.to(device)
+        out = model.forecast(hist, future=fut, return_samples=True)
+        if out.samples is None:
+            continue
+        s = out.samples[..., channel]
+        v = s.var(dim=1, unbiased=False)
+        tot += float(v.sum().item())
+        n += v.numel()
+    return tot / max(n, 1.0)
+
+
 def empirical_interval_coverage(
     samples: np.ndarray,
     obs: np.ndarray,

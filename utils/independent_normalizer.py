@@ -72,10 +72,15 @@ class IndependentNormalizer:
 def mom_aggregate_normalized(
     stacked: torch.Tensor,
     num_groups: int,
+    cold_bias_blend: float = 0.0,
+    cold_sharpness: float = 2.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     stacked: (B, K, L, C) 归一化空间中的 K 条轨迹。
     分成 M=num_groups 组，每组 S=K/M 条求均值，再对 M 个组均值取逐元素中位数（Median-of-Means）。
+
+    cold_bias_blend ∈ [0,1]：与「偏低组加权」凸组合，缓解集成平滑导致冷尾略偏高；0 为原版纯中位数。
+    cold_sharpness：越大越偏向组内均值更低的样本（在归一化空间、逐 (B,L,C) 上对 M 组做 softmax）。
 
     返回：(single, sample_mean, mom) 均在归一化空间，shape (B, L, C)。
     """
@@ -85,7 +90,20 @@ def mom_aggregate_normalized(
         raise ValueError(f"要求 K={k} 能被 M={m} 整除，便于 MoM 分组")
     s = k // m
     grouped = stacked.reshape(b, m, s, l, c).mean(dim=2)
-    mom = grouped.median(dim=1).values
+    mom_med = grouped.median(dim=1).values
+    beta = float(max(0.0, min(1.0, cold_bias_blend)))
+    if beta <= 0.0:
+        mom = mom_med
+    else:
+        sharp = float(max(0.0, cold_sharpness))
+        if sharp <= 0.0:
+            mom_cold = grouped.mean(dim=1)
+        else:
+            logits = -sharp * grouped
+            logits = logits - logits.max(dim=1, keepdim=True).values
+            w = torch.softmax(logits, dim=1)
+            mom_cold = (w * grouped).sum(dim=1)
+        mom = (1.0 - beta) * mom_med + beta * mom_cold
     sample_mean = stacked.mean(dim=1)
     single = stacked[:, 0].contiguous()
     return single, sample_mean, mom
