@@ -105,11 +105,23 @@ class GaussianDiffusion(nn.Module):
         hist: torch.Tensor,
         l1_weight: float = 0.0,
         temporal_diff_weight: float = 0.0,
+        mse_huber_alpha: float = 1.0,
+        huber_beta: float = 1.0,
     ) -> torch.Tensor:
         noise = torch.randn_like(x0)
         x_t = self.q_sample(x0, t, noise)
         pred = model(x_t, t, hist)
-        loss = F.mse_loss(pred, noise)
+        a = float(mse_huber_alpha)
+        b = float(huber_beta)
+        if a >= 1.0 - 1e-8:
+            main = F.mse_loss(pred, noise)
+        elif a <= 1e-8:
+            main = F.smooth_l1_loss(pred, noise, beta=b)
+        else:
+            main = a * F.mse_loss(pred, noise) + (1.0 - a) * F.smooth_l1_loss(
+                pred, noise, beta=b
+            )
+        loss = main
         if l1_weight > 0:
             loss = loss + l1_weight * F.l1_loss(pred, noise)
         if temporal_diff_weight > 0 and x0.shape[1] >= 2:

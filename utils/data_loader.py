@@ -130,25 +130,33 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
         cfg.global_mean = None
         cfg.global_std = None
 
+    pin = bool(torch.cuda.is_available())
+    nw = int(cfg.num_workers)
+    dl_common: dict = {
+        "batch_size": cfg.batch_size,
+        "num_workers": nw,
+        "pin_memory": pin,
+    }
+    if nw > 0:
+        dl_common["prefetch_factor"] = 2
+        dl_common["persistent_workers"] = True
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=cfg.num_workers,
         drop_last=True,
+        **dl_common,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
         drop_last=False,
+        **dl_common,
     )
     test_loader = DataLoader(
         test_ds,
-        batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
         drop_last=False,
+        **dl_common,
     )
     return train_loader, val_loader, test_loader, C, names

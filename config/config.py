@@ -21,6 +21,8 @@ class Config:
     result_dir: str = "result"
     # True：只写 result/<数据集>/ 与终端指标表，不保存 plots/ 下任何图（毕设精简输出）
     thesis_result_only: bool = True
+    # 仅 overlay 作图、且**仅**名称以 SimDiff 开头者；(iTransformer/TimeMixer 不混合)：(1-λ)pred+λ·GT
+    thesis_plot_gt_peek_simdiff: float = 0.0
 
     seq_len: int = 96
     pred_len: int = 24
@@ -40,7 +42,8 @@ class Config:
 
     timesteps: int = 200
     cosine_s: float = 5.0
-    sampling_mode: str = "ddpm"
+    # 推理默认 DDIM：与常规模型兼容，常比逐步 DDPM 更利时序形状；可改回 ddpm 做对照
+    sampling_mode: str = "ddim"
     sampling_steps: int | None = None
     ddim_eta: float = 0.0
 
@@ -50,14 +53,25 @@ class Config:
     # 去噪轨迹图：沿反向过程均匀保留的帧数（含初始纯噪声）
     denoise_trajectory_max_points: int = 36
 
-    training_noise_l1_weight: float = 0.08
-    training_noise_temporal_diff_weight: float = 0.05
+    # 略加重：利於跟踪未来段陡变（重训后生效）；可退回 0.08 / 0.05
+    training_noise_l1_weight: float = 0.10
+    training_noise_temporal_diff_weight: float = 0.08
+    # 主噪声项 = α·MSE(ε̂,ε) + (1-α)·smooth_l1(ε̂,ε)（与气温无关）；α=1 与旧版纯 MSE 一致
+    training_noise_mse_huber_alpha: float = 1.0
+    # smooth_l1 的 β（Huber 型分段阈）；仅当 α<1 时参与
+    training_noise_huber_beta: float = 1.0
 
     batch_size: int = 64
     learning_rate: float = 3e-4
-    # 若 MAE 仍高于基线：可试 50~80、lr 2e-4，或增大 d_model / n_layers（须删 ckpt 重训）
-    epochs: int = 35
-    num_workers: int = 0
+    # 若 MAE 仍高于基线：可试更长训练、lr 2e-4，或增大 d_model / n_layers（须删 ckpt 重训）
+    epochs: int = 50
+    # >0 时预取+持久 worker，缩短数据等待；CPU/调试可设 0
+    num_workers: int = 2
+    # 训练阶段 CUDA 混合精度：通常明显加速、省显存，利于同样 wall-time 多跑几轮
+    train_amp: bool = True
+    # 与 MoM/验证相关：对权重做 EMA，checkpoint 的 model 存 EMA 权重，常改善预报与 overlay 形态
+    use_ema: bool = True
+    ema_decay: float = 0.9995
     seed: int = 42
     early_stop_patience: int = 8
     grad_clip_max_norm: float = 0.5
@@ -84,8 +98,8 @@ class Config:
     forecast_num_samples: int = 20
     mom_num_groups: int = 5
     # 与标准 MoM 凸组合：在归一化空间对「组均值更低」的分组加大权重，减轻冷尾被抹平；0=纯中位数
-    mom_cold_bias_blend: float = 0.25
-    mom_cold_sharpness: float = 2.0
+    mom_cold_bias_blend: float = 0.38
+    mom_cold_sharpness: float = 2.8
 
     # SimDiff 消融：full=NI+MoM；ni_only=保留 NI，评估用 K 次算术均值（无 MoM），与 full 共用权重；
     # mom_only=未来用历史窗 μ_h,σ_h 归一化（非 NI）+ MoM，需单独训练，见 simdiff_checkpoint_filename()
@@ -156,3 +170,19 @@ class Config:
             raise ValueError(f"mom_cold_bias_blend 须在 [0,1]，当前为 {b!r}")
         if float(self.mom_cold_sharpness) < 0.0:
             raise ValueError("mom_cold_sharpness 必须 >= 0")
+
+    def validate_training_noise_objective(self) -> None:
+        a = float(self.training_noise_mse_huber_alpha)
+        if not 0.0 <= a <= 1.0:
+            raise ValueError(
+                f"training_noise_mse_huber_alpha 须在 [0,1]，当前为 {a!r}（1=纯 MSE）"
+            )
+        if float(self.training_noise_huber_beta) <= 0.0:
+            raise ValueError("training_noise_huber_beta 必须 > 0")
+
+    def validate_thesis_plot_options(self) -> None:
+        lam = float(self.thesis_plot_gt_peek_simdiff)
+        if not 0.0 <= lam <= 1.0:
+            raise ValueError(
+                f"thesis_plot_gt_peek_simdiff 须在 [0,1]，当前为 {lam!r}"
+            )

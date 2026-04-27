@@ -388,6 +388,10 @@ def eval_channel_mse_mae(
     device: torch.device,
     channel: int,
 ) -> tuple[float, float]:
+    """
+    单通道、全测试步平均 MSE 与 MAE（与 `eval_forecasts_mse_mae` 一致：先 MSE 后 MAE）。
+    main / 基线条形图 须按 (mse, mae) 解包或按对分别传入 MAE 柱、MSE 柱。
+    """
     sum_sq = 0.0
     sum_abs = 0.0
     n = 0

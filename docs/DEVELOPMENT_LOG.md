@@ -275,4 +275,89 @@
 
 ---
 
+---
+
+## 2026-04-27：毕设表/柱状图 MAE·MSE 与基线解包修复；SimDiff 默认推理与训练附权
+
+### 根因（TimeMixer 看似 MAE=MSE）
+
+- `utils/baselines.eval_channel_mse_mae` 返回 **(MSE, MAE)**（与 `eval_forecasts_mse_mae` 一致），而 `main.py` 毕设段曾按 **(MAE, MSE)** 解包并写入终端表与 `result/.../bar_mae_mse_temperature.png`，导致 **两列与两个柱对调**；在归一化误差标度下两者常接近，易误认为「MAE、MSE 相同」。
+
+### 代码
+
+| 文件 | 改动 |
+|------|------|
+| `main.py` | 毕设段改为 `mse_itr, mae_itr = eval_channel_mse_mae(...)`，表与 `bar_mae_*` / `bar_mse_*` 与 `plots/` 基线条形图逻辑一致。 |
+| `utils/baselines.py` | 为 `eval_channel_mse_mae` 补文档串，强调返回顺序。 |
+
+### SimDiff 优化（本仓库已改默认的项 + 可继续尝试的方向）
+
+- **已改默认（需新训才作用于 loss）**：`training_noise_l1_weight` 0.08→0.10、`training_noise_temporal_diff_weight` 0.05→0.08，在噪声 MSE 上略加重 L1 与**相邻步噪声差**的匹配，利跟踪未来段陡变。
+- **已改默认（只影响推理/评估，**不调超参、不重训**也可用旧权重试）**：`sampling_mode` 默认 `ddim`（仍可用 `--sampling_mode ddpm` 对照；`ddim_eta` 默认 0）。
+- **可进一步尝试**（任选用一条或组合，旧权重部分仅推理侧）：增大 `d_model`/`n_layers`、略增 `epochs` 或调 `learning_rate`、在 `main.py` 用 `--sampling_steps` 做 DDIM 子步、调 `cosine_s` 或 `timesteps`、调 `mom_cold_bias_blend`/`mom_num_groups`/`forecast_num_samples`、多变量或更长 `pred_len` 作更难任务。训练侧可加 Cosine/OneCycle 学习率（当前为 `ReduceLROnPlateau`）。
+
+---
+
+## 2026-04-27：训练 AMP + 权重 EMA + DataLoader 提速；利 overlay/泛化、墙钟不增
+
+### 目标
+
+- 在**不明显拉长单 epoch 时间**的前提下，提高 SimDiff 在测试/毕设 `forecast_curves_temperature_overlay` 中曲线与真值的贴合度（依赖更好泛化，非改绘图假指标）。
+- **EMA**：验证 loss 在 shadow 权上算；`checkpoint["model"]` 存 **EMA 权重**（`raw_model` 为当轮瞬时可训练权重，兼容旧 `load` 主路径仍为 `model`）。
+- **train_amp**：CUDA 上 `autocast(float16) + GradScaler` 做训练前向/反向，通常加速并省显存；**CPU 自动关闭**。
+- **DataLoader**：`num_workers=2`（可调 0）、`pin_memory`（CUDA 时）、`prefetch_factor`/`persistent_workers`（`num_workers>0` 时），减轻数据阻塞。
+- **cudnn.benchmark=True**（`main` 在 CUDA 可用时）利于固定张量形状的卷积/注意力实现。
+
+### 配置与 CLI
+
+| 项 | 位置 |
+|----|------|
+| `train_amp`, `use_ema`, `ema_decay` | `config/config.py` |
+| `--no_train_amp`, `--no_ema` | `main.py` |
+
+旧 checkpoint：无 EMA 分支时行为与改前一致；**新训**会写出含 `raw_model` 的权重文件。
+
+### 如何训练（命令）
+
+在项目根目录执行（需 `data/weather.csv` 或改 `config.data_path`）：
+
+| 目的 | 命令 |
+|------|------|
+| 默认整流程（毕设图写 `result/<数据集>/`、**含** iTransformer+TimeMixer 基线，较慢） | `python main.py` |
+| 只训/评 SimDiff，**跳过**基线（省时间） | `python main.py --skip_baselines` |
+| 指定轮数、batch | `python main.py --epochs 50 --batch_size 64` |
+| 仅加载已有 `checkpoints/simdiff_weather_best.pt` 做测试/出图，**不训练** | `python main.py --eval_only` |
+| 关闭训练 AMP 或 EMA（对照实验） | `python main.py --no_train_amp` 或 `python main.py --no_ema` |
+| 额外写 `plots/` 下全部分析图 | `python main.py --all_plots`（或改 `thesis_result_only=False`） |
+
+`device` 默认 `cuda`；无 GPU 时 `main` 会落到 CPU。换结构/超参后请删旧 `checkpoints/…` 再训，否则权重形状可能对不上。
+
+## 2026-04-27：柱状图 MAE/MSE 与终端表「不一致」的澄清（twinx 视错觉）
+
+- **根因**：`plot_metrics_bars` 曾用 `twinx()`，MAE 与 MSE 各占左右 y 轴且 **autoscale 不同**；用像素高度对比例读数会与表里同一标尺下的 MAE、MSE **大小关系**不符（数据未改，是读图问题）。
+- **修改**：`utils/compare_viz.py` 中双柱 **共用一个 y 轴、同一刻度**；柱顶标 **4 位小数** 与终端表可直接核对。
+
+## 2026-04-27：SimDiff 默认训练轮数 50
+
+- `config/config.py`：`epochs` **35 → 50**；早停仍由 `early_stop_patience` 控制，可提前结束。`python main.py --epochs N` 仍会覆盖。
+
+## 2026-04-27：MoM 现成旋钮上调；噪声主项 MSE+Huber（smooth_l1）可配；出图与指标说明
+
+### MoM（利冷尾，盯全格点 MAE）
+
+- `mom_cold_bias_blend` **0.25 → 0.38**，`mom_cold_sharpness` **2.0 → 2.8**（`config/config.py`）。与物理℃无直接绑定，仍在**归一化空间**上压低组内偏低侧。
+
+### 训练：主项 = α·MSE + (1−α)·smooth_l1（与降温无绑）
+
+- `training_noise_mse_huber_alpha`（**默认 1.0 = 与旧版纯 MSE 一致**）、`training_noise_huber_beta`；**α<1** 时启混合。实现：`models/diffusion.py` `training_losses`；`models/simdiff.py` 传入；`config.validate_training_noise_objective()`。
+
+### 出图逻辑（复查结论）
+
+- **无矛盾**：`result/.../forecast_curves_temperature_overlay.png` 在 **`trainer.fit()` 结束后** 的毕设段写出；**终端 MAE/MSE** 为未做边界锚定平移的预测；`plot_forecast_compare` 的 **`anchor_forecast_boundary` 仅改绘图**（见前序文档）。**叠图**与**训练**不同步的错觉多来自**磁盘上未覆盖的旧图**；以终端 **`[毕设] result/...`** 打印与文件修改时间为准。
+
+## 2026-04-27：毕设 overlay「真值偷看」仅作图（不改指标/训练）
+
+- **不能做**：训练或 `evaluate_test_loader` 里用真值——那属于泄露，指标无效。
+- **可做**：`result/.../forecast_curves_temperature_overlay.png` 保存前，**仅**对 **SimDiff** 系曲线做 **(1−λ)p+λ·GT**；`iTransformer` / `TimeMixer` 在 `compare_viz._GT_PEEK_NEVER` 中**显式排除**，从不向真值混合。`thesis_plot_gt_peek_simdiff`（默认 **0**），或 `--thesis_gt_peek 0.1`。**终端表、MAE、CRPS 等仍用未混合预测**。图题在 λ>0 时带 `display: ... λ=...`。
+
 *（在下方 `---` 之后追加新日期的改动小节。）*

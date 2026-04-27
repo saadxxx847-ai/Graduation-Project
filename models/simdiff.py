@@ -107,6 +107,8 @@ class SimDiffWeather(nn.Module):
             hist_n,
             l1_weight=float(self.cfg.training_noise_l1_weight),
             temporal_diff_weight=float(self.cfg.training_noise_temporal_diff_weight),
+            mse_huber_alpha=float(self.cfg.training_noise_mse_huber_alpha),
+            huber_beta=float(self.cfg.training_noise_huber_beta),
         )
 
     @torch.no_grad()

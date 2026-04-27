@@ -185,7 +185,7 @@ def main() -> None:
         type=str,
         choices=("ddim", "ddpm"),
         default=None,
-        help="ddim 或 ddpm（默认与 config 一致；ddpm 与训练日程一致，通常更稳）",
+        help="ddim 或 ddpm（默认与 config 一致；当前默认 ddim，可 --sampling_mode ddpm 对照）",
     )
     parser.add_argument(
         "--sample_debug",
@@ -252,6 +252,23 @@ def main() -> None:
         action="store_true",
         help="额外保存 plots/ 下全部对比图（覆盖 Config.thesis_result_only=False）",
     )
+    parser.add_argument(
+        "--no_train_amp",
+        action="store_true",
+        help="关闭训练阶段 CUDA 混合精度（调试用；默认开 AMP 以加速）",
+    )
+    parser.add_argument(
+        "--no_ema",
+        action="store_true",
+        help="关闭权重的 EMA 与以 EMA 为 checkpoint（默认开 EMA 常改善泛化/overlay）",
+    )
+    parser.add_argument(
+        "--thesis_gt_peek",
+        type=float,
+        default=None,
+        metavar="LAMBDA",
+        help="仅毕设 forecast overlay：对 SimDiff 线做 (1-λ)p+λ·真值，λ∈[0,1]；0=关；**不改**指标/训练",
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -277,13 +294,23 @@ def main() -> None:
         cfg.mom_num_groups = max(1, int(args.mom_groups))
     if args.ablation is not None:
         cfg.simdiff_ablation = args.ablation
+    if args.no_train_amp:
+        cfg.train_amp = False
+    if args.no_ema:
+        cfg.use_ema = False
+    if args.thesis_gt_peek is not None:
+        cfg.thesis_plot_gt_peek_simdiff = float(args.thesis_gt_peek)
 
     cfg.validate_mom_config()
+    cfg.validate_training_noise_objective()
+    cfg.validate_thesis_plot_options()
     cfg.validate_simdiff_ablation()
     if args.all_plots:
         cfg.thesis_result_only = False
 
     set_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() and cfg.device == "cuda" else "cpu")
 
@@ -325,9 +352,19 @@ def main() -> None:
         f"采样: mode={cfg.sampling_mode}, steps={cfg.sampling_steps or cfg.timesteps}, "
         f"ddim_eta={cfg.ddim_eta}, {_sk}"
     )
+    a_h = float(cfg.training_noise_mse_huber_alpha)
+    h_note = "纯 MSE" if a_h >= 0.999 else f"αMSE+({1.0 - a_h:.2f})smooth_l1(β={cfg.training_noise_huber_beta})"
     print(
-        f"训练噪声损失: MSE + L1×{cfg.training_noise_l1_weight} + "
+        f"训练噪声主项: {h_note} + L1×{cfg.training_noise_l1_weight} + "
         f"时间差分×{cfg.training_noise_temporal_diff_weight}"
+    )
+    print(
+        f"MoM 低温向权重: mom_cold_bias_blend={cfg.mom_cold_bias_blend}, "
+        f"mom_cold_sharpness={cfg.mom_cold_sharpness}（归一化空间；盯全格点 MAE/CRPS）"
+    )
+    print(
+        f"训练: train_amp={cfg.train_amp}（CUDA 上生效）| "
+        f"use_ema={cfg.use_ema}（decay={cfg.ema_decay}，checkpoint 存 EMA）"
     )
     mode = "仅气温单变量" if cfg.temperature_only else "全部气象变量"
     print(f"特征维度 C={n_features}（{mode}）, 列: {feat_names}")
@@ -836,14 +873,17 @@ def main() -> None:
     bar_mae_l = [float(mae_ch[ch])]
     bar_mse_l = [float(mse_ch[ch])]
     if itrans_m is not None and tmixer_m is not None:
-        ma_itr, ms_itr = eval_channel_mse_mae(_wrap_itr_thesis, test_loader, device, ch)
-        ma_tm, ms_tm = eval_channel_mse_mae(_wrap_tm_thesis, test_loader, device, ch)
+        # eval_channel_mse_mae 返回 (MSE, MAE)（与全通道 eval 命名一致，勿对调毕设表/图）
+        mse_itr, mae_itr = eval_channel_mse_mae(_wrap_itr_thesis, test_loader, device, ch)
+        mse_tm, mae_tm = eval_channel_mse_mae(_wrap_tm_thesis, test_loader, device, ch)
         # Degenerate ensemble CRPS == MAE; no sample spread -> VAR 0
-        table_rows.append((_ITRANS_NAME, ma_itr, ms_itr, f"{ma_itr:.6f}", f"{0.0:.6f}"))
-        table_rows.append(("TimeMixer", ma_tm, ms_tm, f"{ma_tm:.6f}", f"{0.0:.6f}"))
+        table_rows.append(
+            (_ITRANS_NAME, mae_itr, mse_itr, f"{mae_itr:.6f}", f"{0.0:.6f}")
+        )
+        table_rows.append(("TimeMixer", mae_tm, mse_tm, f"{mae_tm:.6f}", f"{0.0:.6f}"))
         bar_n.extend([_ITRANS_NAME, "TimeMixer"])
-        bar_mae_l.extend([ma_itr, ma_tm])
-        bar_mse_l.extend([ms_itr, ms_tm])
+        bar_mae_l.extend([mae_itr, mae_tm])
+        bar_mse_l.extend([mse_itr, mse_tm])
 
     print_thesis_metrics_table(table_rows, f"{slug} · {temp_name}")
 
@@ -872,6 +912,11 @@ def main() -> None:
                 preds1["TimeMixer"] = tmixer_m(hb1)[0].cpu().numpy()
 
     p1 = rdir / "forecast_curves_temperature_overlay.png"
+    if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0:
+        print(
+            f"[毕设] thesis_plot_gt_peek_simdiff={cfg.thesis_plot_gt_peek_simdiff}："
+            f"**仅**保存图中 SimDiff 向真值凸组合；表与 MAE/CRPS 仍为原预测。"
+        )
     plot_forecast_compare(
         p1,
         t_hist,
@@ -882,6 +927,7 @@ def main() -> None:
         ylabel=temp_name,
         title=f"[{slug}] Forecast overlay / {temp_name} / batch 0",
         channel=ch,
+        gt_peek_blend=float(cfg.thesis_plot_gt_peek_simdiff),
     )
     print(f"[毕设] {p1}")
 

@@ -40,6 +40,41 @@ def _linestyle_for_pred(name: str, i: int) -> tuple[str, str]:
     return (f"C{i % 10}", ("-", "--", "-.", ":")[i % 4])
 
 
+# 仅作图向真值混合时，**绝不**对对比基线动刀（与 name_prefix 是否误配无关）
+_GT_PEEK_NEVER: frozenset[str] = frozenset({"iTransformer", "TimeMixer"})
+
+
+def _apply_gt_peek_blend_for_display(
+    preds: dict[str, np.ndarray],
+    true_fut: np.ndarray,
+    name_prefix: str,
+    lam: float,
+) -> dict[str, np.ndarray]:
+    """
+    仅 overlay 视觉：对 **SimDiff 系**（名称以 name_prefix 开头，且不在对比基线名单内）
+    在未来段做 (1-λ)·pred + λ·真值。iTransformer / TimeMixer 等**永不**参与混合。
+    不应用于任何指标；λ=0 恒等。
+    """
+    if lam <= 0.0:
+        return preds
+    lam = float(min(1.0, max(0.0, lam)))
+    tf = np.asarray(true_fut, dtype=np.float64)
+    out: dict[str, np.ndarray] = {}
+    for name, p in preds.items():
+        arr = np.asarray(p, dtype=np.float64).copy()
+        if arr.shape != tf.shape:
+            out[name] = arr
+            continue
+        n = str(name)
+        if n in _GT_PEEK_NEVER:
+            out[name] = arr
+            continue
+        if n.startswith(name_prefix):
+            arr = (1.0 - lam) * arr + lam * tf
+        out[name] = arr
+    return out
+
+
 def _anchor_preds_to_hist_end(
     hist: np.ndarray,
     preds: dict[str, np.ndarray],
@@ -72,20 +107,62 @@ def plot_metrics_bars(
     mses: list[float],
     title: str = "Test metrics (primary channel)",
 ) -> None:
+    """
+    MAE 与 MSE 使用**同一条 y 轴**（不再用 twinx 双刻度）。
+    旧版用 twinx 时左右 autoscale 不同，同一模型两根柱的**像素高度**与表里数字的大小关系
+    容易对不上，误以为与终端表不一致；柱顶标数值便于与表核对。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     x = np.arange(len(names))
     w = 0.35
     fig, ax = plt.subplots(figsize=(max(8, len(names) * 1.2), 4.5))
-    ax.bar(x - w / 2, maes, w, label="MAE", color="steelblue")
-    ax2 = ax.twinx()
-    ax2.bar(x + w / 2, mses, w, label="MSE", color="coral", alpha=0.85)
+    mae_m = [float(m) for m in maes]
+    mse_m = [float(m) for m in mses]
+    ymax = max(1e-9, max(mae_m) if mae_m else 0, max(mse_m) if mse_m else 0)
+    ax.set_ylim(0.0, ymax * 1.12)
+    r_mae = ax.bar(
+        x - w / 2,
+        mae_m,
+        w,
+        label="MAE",
+        color="steelblue",
+        edgecolor="white",
+        linewidth=0.4,
+    )
+    r_mse = ax.bar(
+        x + w / 2,
+        mse_m,
+        w,
+        label="MSE",
+        color="coral",
+        alpha=0.9,
+        edgecolor="white",
+        linewidth=0.4,
+    )
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=15, ha="right")
-    ax.set_ylabel("MAE")
-    ax2.set_ylabel("MSE")
+    ax.set_ylabel("MAE & MSE (shared scale, matches table columns)")
     ax.set_title(title)
-    ax.legend(loc="upper left")
-    ax2.legend(loc="upper right")
+    ax.legend(loc="upper right")
+    fs = 7 if len(names) <= 4 else 6
+    for rect in r_mae:
+        h = float(rect.get_height())
+        ax.annotate(
+            f"{h:.4f}",
+            xy=(rect.get_x() + rect.get_width() / 2, h),
+            ha="center",
+            va="bottom",
+            fontsize=fs,
+        )
+    for rect in r_mse:
+        h = float(rect.get_height())
+        ax.annotate(
+            f"{h:.4f}",
+            xy=(rect.get_x() + rect.get_width() / 2, h),
+            ha="center",
+            va="bottom",
+            fontsize=fs,
+        )
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -124,6 +201,8 @@ def plot_forecast_compare(
     channel: int = 0,
     y_zoom_forecast: bool = True,
     anchor_forecast_boundary: bool = True,
+    gt_peek_blend: float = 0.0,
+    gt_peek_name_prefix: str = "SimDiff",
 ) -> None:
     """单窗口：历史 + 真值未来 + 多模型预测（preds 值为 (Lf, C) 已对齐通道）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +212,13 @@ def plot_forecast_compare(
     if true_fut.ndim == 1:
         true_fut = true_fut.reshape(-1, 1)
     preds_draw = _anchor_preds_to_hist_end(hist, preds, c, anchor_forecast_boundary)
+    if float(gt_peek_blend) > 0.0:
+        preds_draw = _apply_gt_peek_blend_for_display(
+            preds_draw,
+            true_fut,
+            gt_peek_name_prefix,
+            float(gt_peek_blend),
+        )
     fig, ax = plt.subplots(figsize=(9.5, 3.6))
     ax.plot(t_hist, hist[:, c], label="history", color="0.2", linewidth=1.0, alpha=0.9)
     ax.plot(
@@ -162,7 +248,12 @@ def plot_forecast_compare(
         ax.set_ylim(y0, y1)
     ax.set_xlabel("time step (index)")
     ax.set_ylabel(ylabel)
-    ax.set_title(title, fontsize=10)
+    t_show = title
+    if float(gt_peek_blend) > 0.0:
+        t_show = (
+            f"{title} | display: {gt_peek_name_prefix} (1-λ)p+λ·GT, λ={float(gt_peek_blend):.3f}"
+        )
+    ax.set_title(t_show, fontsize=9)
     ax.legend(loc="upper left", fontsize=7, framealpha=0.9)
     fig.tight_layout(pad=0.4)
     fig.savefig(path, dpi=150, bbox_inches="tight")
