@@ -253,6 +253,24 @@ _MS_RMS_ABLATION_SPECS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _parse_ms_rms_only_arg(s: str | None) -> frozenset[str] | None:
+    """--ms_rms_only 子集；None 表示四字全套。"""
+    if s is None or not str(s).strip():
+        return None
+    allowed = {k for k, _ in _MS_RMS_ABLATION_SPECS}
+    parts = [p.strip() for p in str(s).replace(";", ",").split(",") if p.strip()]
+    if not parts:
+        return None
+    out: list[str] = []
+    for p in parts:
+        if p not in allowed:
+            raise ValueError(
+                f"--ms_rms_only: 未知变体 {p!r}，须为 {', '.join(sorted(allowed))}"
+            )
+        out.append(p)
+    return frozenset(out)
+
+
 def _apply_ms_rms_key(cfg: Config, variant_key: str) -> None:
     """窗口起点统一对齐到 i>=576；四组均不使用 HistoryAdditiveBias。"""
     cfg.use_hist_add_bias = False
@@ -324,17 +342,21 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
         )
     rdir = cfg.resolved_result_dir()
     ckpt_dir = cfg.resolved_checkpoint_dir()
+    ms_rms_only = _parse_ms_rms_only_arg(getattr(args, "ms_rms_only", None))
 
-    _ensure_ms_rms_rmsnorm_checkpoint(
-        cfg,
-        ckpt_dir,
-        strict_reuse=bool(getattr(args, "ms_rms_reuse_rmsnorm_ckpt", False)),
-    )
+    if ms_rms_only is None or "rmsnorm_only" in ms_rms_only:
+        _ensure_ms_rms_rmsnorm_checkpoint(
+            cfg,
+            ckpt_dir,
+            strict_reuse=bool(getattr(args, "ms_rms_reuse_rmsnorm_ckpt", False)),
+        )
 
     epochs_non_baseline = int(cfg.epochs)
     epochs_baseline_ms = int(getattr(cfg, "ms_rms_baseline_epochs", 30))
 
     for key, _ in _MS_RMS_ABLATION_SPECS:
+        if ms_rms_only is not None and key not in ms_rms_only:
+            continue
         _apply_ms_rms_key(cfg, key)
         train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
         ckpt_path = ckpt_dir / cfg.simdiff_checkpoint_filename()
@@ -380,8 +402,11 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
     bar_maes: list[float] = []
     bar_mses: list[float] = []
     preds_overlay: dict[str, np.ndarray] = {}
+    evaluated_variant_keys: list[str] = []
 
     for key, label in _MS_RMS_ABLATION_SPECS:
+        if ms_rms_only is not None and key not in ms_rms_only:
+            continue
         _apply_ms_rms_key(cfg, key)
         train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
         if t_idx < 0:
@@ -438,6 +463,7 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
         with torch.no_grad():
             pr = point_prediction_from_forecast(model_v.forecast(hb_i, future=fb_i), cfg).cpu().numpy()
         preds_overlay[label] = pr[0]
+        evaluated_variant_keys.append(key)
         del model_v
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -445,7 +471,12 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
 
     t_hist = np.arange(cfg.seq_len)
     t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
-    _apply_ms_rms_key(cfg, "baseline")
+    ref_key = (
+        "baseline"
+        if "baseline" in evaluated_variant_keys
+        else (evaluated_variant_keys[0] if evaluated_variant_keys else "baseline")
+    )
+    _apply_ms_rms_key(cfg, ref_key)
     _, _, test_loader_b, _, _ = make_loaders(cfg)
     hb_ref, fb_ref = next(iter(test_loader_b))
     hb_ref = hb_ref.to(device)
@@ -453,9 +484,10 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
     hist_plot = hb_ref[0, : cfg.seq_len].detach().cpu().numpy()
     _clear_ms_rms_key(cfg)
 
+    nfold = len(table_rows)
     print_metrics_ascii_table(
         table_rows,
-        headline=f"{slug} · {temp_name} · multiscale × RMSNorm ablation (4-fold)",
+        headline=f"{slug} · {temp_name} · multiscale × RMSNorm ablation ({nfold}-fold)",
         footer_notes=(
             "CRPS/VAR: K-sample MoM on test set; hist concat optional on multiscale arms.",
             "Weights: simdiff_weather_best_ms_rms_<baseline|rmsnorm_only|multiscale_only|full>.pt",
@@ -722,6 +754,21 @@ def main() -> None:
         help="历史步长（默认读取 Config）；增大有助于长期依赖，需重训",
     )
     parser.add_argument(
+        "--pred_len",
+        type=int,
+        default=None,
+        metavar="H",
+        help="未来预报步长（默认 Config.pred_len）；改变后须重训；常与 --ckpt_extra_suffix _plH 联用以免覆盖旧 best",
+    )
+    parser.add_argument(
+        "--ckpt_extra_suffix",
+        type=str,
+        default=None,
+        metavar="SUFFIX",
+        help="追加到 SimDiff checkpoint 文件名 stem 与 .pt 之间（如 _pl48）；"
+        "不写则仍为 simdiff_weather_best_ms_rms_full.pt 等，可能覆盖已有权重",
+    )
+    parser.add_argument(
         "--sampling_steps",
         type=int,
         default=None,
@@ -855,6 +902,14 @@ def main() -> None:
         "不传时默认也会自动尝试复制（顺序同上），缺源则改为训练该项。",
     )
     parser.add_argument(
+        "--ms_rms_only",
+        type=str,
+        default=None,
+        metavar="KEYS",
+        help="仅训练/评估 ms_rms 中的若干变体（逗号分隔），如 full（仅多尺度+RMSNorm 柱）或 baseline,rmsnorm_only；"
+        "默认四字全套。pred_len 扫描时建议 full + --ckpt_extra_suffix _plH，避免训齐四柱。",
+    )
+    parser.add_argument(
         "--dual_reuse_b_only_ckpt",
         action="store_true",
         help="已弃用：等价于 --ms_rms_reuse_rmsnorm_ckpt",
@@ -926,6 +981,11 @@ def main() -> None:
         cfg.test_batch_size = max(1, int(args.test_batch_size))
     if args.seq_len is not None:
         cfg.seq_len = args.seq_len
+    if args.pred_len is not None:
+        cfg.pred_len = max(1, int(args.pred_len))
+    if args.ckpt_extra_suffix is not None:
+        s = str(args.ckpt_extra_suffix).strip()
+        cfg.simdiff_checkpoint_extra_suffix = s if s else None
     if args.sampling_steps is not None:
         cfg.sampling_steps = args.sampling_steps
     if args.ddim_eta is not None:
@@ -974,6 +1034,11 @@ def main() -> None:
     cfg.validate_thesis_plot_options()
     cfg.validate_simdiff_ablation()
     cfg.validate_denoiser_embedding_options()
+    if getattr(args, "ms_rms_only", None):
+        try:
+            _parse_ms_rms_only_arg(args.ms_rms_only)
+        except ValueError as e:
+            parser.error(str(e))
     if args.all_plots:
         cfg.thesis_result_only = False
 

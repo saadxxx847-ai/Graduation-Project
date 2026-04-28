@@ -56,6 +56,8 @@ class Config:
     denoiser_variant: str | None = None
     # "dual"（旧 HistAdd 套件，仍兼容文件名）； "ms_rms"：多尺度 + RMSNorm 四组消融 → simdiff_weather_best_ms_rms_<...>.pt
     ablation_ckpt_suite: str | None = None
+    # 插在 checkpoint stem 与 .pt 之间（如 "_pl48"），与 denoiser_variant 独立；用于不同 pred_len 训练时避免覆盖默认文件名
+    simdiff_checkpoint_extra_suffix: str | None = None
 
     timesteps: int = 200
     cosine_s: float = 5.0
@@ -212,7 +214,8 @@ class Config:
                 stem = f"{stem}_ms_rms_{v}"
             else:
                 stem = f"{stem}_{v}"
-        return f"{stem}.pt"
+        extra = self.simdiff_checkpoint_extra_suffix or ""
+        return f"{stem}{extra}.pt"
 
     def validate_simdiff_ablation(self) -> None:
         allowed = ("full", "ni_only", "mom_only")

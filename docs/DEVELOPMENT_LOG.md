@@ -762,3 +762,157 @@ python main.py --ms_rms_ablation --eval_only --skip_baselines
 - **`plot_forecast_compare` / `plot_forecast_compare_two_panels`**：在 history **末点**与 ground truth **首点**之间额外画一段黑色连线（与 GT 线宽一致），消除两段折线在边界处的视觉缝隙。
 
 ---
+
+## 2026-04-29：预测长度（pred_len）精度趋势 — 与单权重物理约束
+
+### 设计说明（必读）
+
+- **`pred_len` 决定去噪网络未来段长度**（`DenoiserTransformer.pos_f` 等），与 checkpoint **强绑定**。现有 **`simdiff_weather_best_ms_rms_full.pt`** 仅在**训练当时**的 `pred_len`（默认 **24**）下形状匹配。
+- 要对 **48 / 72 / 168 / 192** 比较「不同总预报步长」下的测试精度，需要 **每个 pred_len 单独训练** 得到权重；不能用一个 full 权重直接改 `pred_len` 推理。
+- **trainer meta**（`pred_len`）已写入 checkpoint，可对账训练配置。
+
+### 建议产出图件
+
+| 图 | 含义 |
+|----|------|
+| **`mae_mse_vs_pred_len_ms_rms_full*.png`**（双轴折线） | 横轴：**pred_len**（48、72、168、192）；左轴 **MAE**、右轴 **MSE**（全测试集、气温通道），模型：**SimDiff multiscale + RMSNorm**。 |
+| （可选）终端表 | 同一脚本轮询打印 `pred_len / MAE / MSE`。 |
+
+与 **`mae_by_horizon.png`**（固定 pred_len 下 **逐步** MAE）区分：前者是「换窗口总长」，后者是「窗口内第几步误差大」。
+
+### 权重文件命名约定（避免互相覆盖）
+
+训练完某一 pred_len 后，将 `simdiff_weather_best_ms_rms_full.pt` **复制为**：
+
+`checkpoints/simdiff_weather_best_ms_rms_full_pl{pred_len}.pt`
+
+再训下一个 pred_len，以免覆盖。
+
+### 脚本与绘图 API
+
+| 文件 | 说明 |
+|------|------|
+| **`scripts/eval_pred_len_trend_ms_rms_full.py`** | 按 `--pred_lens` 加载上述命名权重，跑测试 MAE/MSE，写 **一张** 双轴折线图（横轴 pred_len，左 MAE 右 MSE，图例 **SimDiff**）。**默认输出目录：`length/`**（`mae_mse_vs_pred_len_ms_rms_full_<后缀>.png`）。**与 `main.py --ms_rms_ablation` 训练结束时的柱状图/overlay 无关**；后者仍在 `result/<数据集>/` 与 `xiaorong/`。 |
+| **`utils/compare_viz.plot_pred_len_accuracy_trend`** | 双轴折线图实现。 |
+
+示例：
+
+```bash
+python scripts/eval_pred_len_trend_ms_rms_full.py --pred_lens 48,72,168,192
+```
+
+缺少对应 `*_pl*.pt` 的长度会 `[skip]`，仅对已存在的权重画趋势。
+
+### 单文件 `simdiff_weather_best_ms_rms_full.pt` 与对比实验（2026-04-28 对话补充）
+
+- **与 `*_pl*.pt` 的关系**：磁盘上若仅有 **`simdiff_weather_best_ms_rms_full.pt`**（无 `_pl48` 等后缀），它只对应**训练当时**的 `pred_len`（默认配置为 **24**）。**不能**用该权重在 `eval_pred_len_trend` 里冒充 48/72/168/192；脚本会按 `pred_len` 构造网络，**形状与 checkpoint 不一致会加载失败或结果无效**。
+- **训练各长度的 full 权重**：`pred_len` 参与 `DenoiserTransformer` / 扩散维数；需对每个目标长度单独训练 **ms_rms `full`**。**避免覆盖**磁盘上已有的 `simdiff_weather_best_ms_rms_full.pt`（例如 pred_len=24）：训练时使用 **`--pred_len H --ckpt_extra_suffix _plH`**，保存为 `simdiff_weather_best_ms_rms_full_plH.pt`，与 `scripts/eval_pred_len_trend_ms_rms_full.py` 默认 `ckpt_format` 一致。对应字段：`Config.simdiff_checkpoint_extra_suffix`；checkpoint `meta` 含 `simdiff_checkpoint_extra_suffix`。仅 `--pred_len`、不加后缀时，文件名不变，**仍会覆盖**同 stem 的旧权重。
+- **是否需要对比实验**：
+  - **画「精度随 pred_len 变化」这一条线**：**不强制**与 iTransformer/TimeMixer 或 persistence 同图对比；**一条 SimDiff multiscale+RMSNorm 曲线 + MAE/MSE 双轴**即可回答「更长预报窗口是否更难」。
+  - **可选增强**（工作量显著）：在每个 `pred_len` 上另训/另评基线（如 persistence 或 iTransformer），做多条曲线；或固定某一 `pred_len` 的基线对比留在正文其它图（如 `bar_mae_mse_*`、`mae_by_horizon.png`），本图专注 **SimDiff 结构在不同总长度下的退化趋势**，避免重复劳动。
+- **勿与 `mae_by_horizon.png` 混淆**：后者是**固定** `pred_len` 下**逐步**（第 1～H 步）的平均 MAE；本实验是**改变整窗未来长度 H** 后的**全窗平均** MAE/MSE。
+
+---
+
+## 2026-04-28：`--pred_len` 与 `--ckpt_extra_suffix`（避免覆盖旧 checkpoint）
+
+### 行为
+
+- **`--pred_len H`**：覆盖 `Config.pred_len`（须 `>=1`）；改变后须重训。
+- **`--ckpt_extra_suffix SUFFIX`**：写入 `Config.simdiff_checkpoint_extra_suffix`，`simdiff_checkpoint_filename()` 变为 `{stem}{SUFFIX}.pt`（如 `…_ms_rms_full_pl48.pt`）。不传则与此前一致，**训练仍可能覆盖**同名 `…_full.pt`。
+- **评估脚本** `eval_pred_len_trend_ms_rms_full.py` **只读**权重、不写 checkpoint，不会动旧 `pt`。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `config/config.py` | `simdiff_checkpoint_extra_suffix`；`simdiff_checkpoint_filename()` 拼接 |
+| `utils/trainer.py` | `meta` 增加 `simdiff_checkpoint_extra_suffix` |
+| `main.py` | CLI `--pred_len`、`--ckpt_extra_suffix` |
+
+---
+
+## 2026-04-28：`--ms_rms_only`（pred_len 扫描只训 full 柱）
+
+### 行为
+
+- **`--ms_rms_only KEYS`**：`KEYS` 为逗号分隔子集，取自 `baseline` / `rmsnorm_only` / `multiscale_only` / **`full`**（多尺度历史拼接 + RMSNorm 编码栈，即消融「两模块都有」的柱）。默认不传的仍为 **四柱全套**。
+- 仅子集时 **跳过** `_ensure_ms_rms_rmsnorm_checkpoint`（除非子集里仍含 `rmsnorm_only`）。
+- 评估段 overlay 的参考 batch：若含 `baseline` 仍用 baseline；**仅 `full`** 时用 full 的 `test_loader` 取首 batch，避免强依赖 baseline 权重。
+
+### 与 pred_len + 防覆盖联用示例
+
+```bash
+# 仅训 full，pred_len=48，权重写入 …_full_pl48.pt（不覆盖无后缀的旧 full）
+python main.py --ms_rms_ablation --ms_rms_only full --pred_len 48 \
+  --ckpt_extra_suffix _pl48 --epochs 40 --skip_baselines
+```
+
+对 72 / 168 / 192 各改 `--pred_len` 与 `--ckpt_extra_suffix` 再跑即可。
+
+---
+
+## 2026-04-28：iTransformer `pred_len` 扫表 → 双轴折线图（与 `mae_mse_vs_pred_len_manual` 同风格）
+
+### 背景
+
+终端汇总表 **「--- iTransformer pred_len sweep 汇总（test，气温通道）---」** 中 MAE/MSE 随 `pred_len`（48 / 72 / 168 / 192）变化，需与 `length/mae_mse_vs_pred_len_manual.png` **同版式**（双轴、MAE 实线圆点、MSE 虚线方点）出图，且 **不覆盖** 已有文件、**不经过** `main.py` 或权重加载，避免影响 SimDiff 训练/评估。
+
+### 产出文件
+
+| 文件 | 说明 |
+|------|------|
+| `length/itrans_pred_len_sweep_temp.csv` | 三列 `pred_len,mae,mse`（可 `#` 注释首行）；数据与终端表一致。 |
+| `length/mae_mse_vs_pred_len_itrans_auto_v1.png` | 上述数据的折线图；若需新版本，请改 `--out` 文件名（如 `_v2` 或时间戳）。 |
+
+### 脚本改动
+
+`scripts/plot_pred_len_trend_manual.py` 增加可选参数 **`--curve-label`**、**`--title`**（默认仍为 SimDiff / ms_rms full 标题），便于同一脚本画基线曲线而无需复制粘贴整套绘图代码。
+
+### 复现命令
+
+```bash
+cd /path/to/Simdiff_weather
+python scripts/plot_pred_len_trend_manual.py \
+  --csv length/itrans_pred_len_sweep_temp.csv \
+  --out length/mae_mse_vs_pred_len_itrans_auto_v1.png \
+  --curve-label "iTransformer" \
+  --title "[weather] Test MAE / MSE vs prediction length (iTransformer, test, T degC)"
+```
+
+**说明**：`scripts/train_eval_itrans_pred_len_trend.py` 训练/扫表结束若加 `--plot`，默认会写 `length/mae_mse_vs_pred_len_itransformer.png`；此处为 **仅根据已有数值表重画**，与那条默认输出路径区分，防止互相覆盖。
+
+---
+
+## 2026-04-28：SimDiff 与 iTransformer · 同图双轴对比（pred_len 对齐）
+
+### 目的
+
+将 **主模型 SimDiff（multiscale + RMSNorm, ms_rms full）** 与 **对比模型 iTransformer** 在相同 `pred_len` 网格 **48 / 72 / 168 / 192** 上的 test 气温通道 **MAE/MSE** 画在 **一张** 双轴折线图中，便于直观比较。
+
+### 数据来源
+
+- SimDiff：与各 `pred_len` 训练后终端 **1-fold** 表一致（与 `plot_pred_len_trend_manual.py` 内置默认表相同）。
+- iTransformer：与 `length/itrans_pred_len_sweep_temp.csv` / iTransformer pred_len sweep 汇总表一致。
+
+### 产出
+
+| 文件 | 说明 |
+|------|------|
+| `length/simdiff_vs_itrans_pred_len_overlay.csv` | 五列：`pred_len`，SimDiff MAE/MSE，iTransformer MAE/MSE（可改数后仍用脚本常量或自行扩脚本从 CSV 读取）。 |
+| `length/mae_mse_vs_pred_len_simdiff_vs_itrans_v1.png` | 四条线：左轴两条 MAE（圆 / 三角），右轴两条 MSE（方 / 菱形，虚线）。 |
+
+### 脚本
+
+**`scripts/plot_pred_len_simdiff_vs_itrans.py`**：仅 matplotlib，**不加载** `main`、checkpoint。**另存图时请改 `--out`**，勿覆盖既有 png。
+
+### 复现命令
+
+```bash
+cd /path/to/Simdiff_weather
+python scripts/plot_pred_len_simdiff_vs_itrans.py \
+  --out length/mae_mse_vs_pred_len_simdiff_vs_itrans_v2.png
+# 可选：--title "自定义标题"
+```
+
+---

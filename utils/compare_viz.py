@@ -199,6 +199,42 @@ def plot_metrics_bars(
     plt.close(fig)
 
 
+def plot_pred_len_accuracy_trend(
+    path: Path,
+    pred_lens: list[int] | np.ndarray,
+    maes: list[float] | np.ndarray,
+    mses: list[float] | np.ndarray,
+    *,
+    curve_label: str = "SimDiff ms_rms full",
+    title: str = "Test accuracy vs prediction length",
+    ylabel_left: str = "MAE",
+    ylabel_right: str = "MSE",
+) -> None:
+    """
+    不同总预报步长 pred_len 下的全测试集平均 MAE/MSE 趋势（须各长度单独训练权重）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    xs = np.asarray(pred_lens, dtype=np.float64)
+    ma = np.asarray(maes, dtype=np.float64)
+    ms = np.asarray(mses, dtype=np.float64)
+    fig, ax1 = plt.subplots(figsize=(8.5, 4.2))
+    (ln1,) = ax1.plot(xs, ma, marker="o", linewidth=1.6, label=f"{curve_label} · MAE", color="C0")
+    ax1.set_xlabel("Prediction length (steps)")
+    ax1.set_ylabel(ylabel_left, color="C0")
+    ax1.tick_params(axis="y", labelcolor="C0")
+    ax2 = ax1.twinx()
+    (ln2,) = ax2.plot(xs, ms, marker="s", linewidth=1.4, linestyle="--", label=f"{curve_label} · MSE", color="C1")
+    ax2.set_ylabel(ylabel_right, color="C1")
+    ax2.tick_params(axis="y", labelcolor="C1")
+    ax1.set_xticks(xs)
+    ax1.grid(True, alpha=0.28)
+    ax1.set_title(title, fontsize=10)
+    ax1.legend(handles=[ln1, ln2], loc="upper left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_horizon_mae(
     path: Path,
     horizon_maes: dict[str, np.ndarray],

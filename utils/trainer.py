@@ -53,6 +53,7 @@ def _config_to_meta(cfg: Config) -> dict:
         "use_rmsnorm": cfg.use_rmsnorm,
         "ablation_ckpt_suite": getattr(cfg, "ablation_ckpt_suite", None),
         "denoiser_variant": cfg.denoiser_variant,
+        "simdiff_checkpoint_extra_suffix": getattr(cfg, "simdiff_checkpoint_extra_suffix", None),
         "result_name_suffix": cfg.result_name_suffix,
         "forecast_amp": cfg.forecast_amp,
         "train_amp": cfg.train_amp,
