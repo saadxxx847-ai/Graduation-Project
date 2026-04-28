@@ -271,7 +271,11 @@ def plot_forecast_compare(
     gt_peek_blend: float = 0.0,
     gt_peek_name_prefix: str = "SimDiff",
 ) -> None:
-    """单窗口：历史 + 真值未来 + 多模型预测（preds 值为 (Lf, C) 已对齐通道）。"""
+    """
+    单窗口：历史 + 真值未来 + 多模型预测。
+    **横轴**：`hist` 行数须等于 `len(t_hist)`；未来段须紧接历史，`t_fut[0]` 应为 `len(t_hist)`（即 conditioning 长度），
+    不得误用 `seq_len` 当未来起点（多尺度 history 长于 seq_len 时否则会与 history 在 x 轴重叠并出现折返）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     c = int(channel)
     if hist.ndim == 1:

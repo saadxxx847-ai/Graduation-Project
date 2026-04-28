@@ -266,6 +266,29 @@ def _val_mse(model: nn.Module, val_loader: torch.utils.data.DataLoader, device: 
     return float(np.mean(losses)) if losses else float("nan")
 
 
+class BaselineHistTrim(nn.Module):
+    """
+    多尺度 SimDiff 的历史为 (B, seq_len+11, C)；学习型基线仍为 (B, seq_len, C)。
+    此处仅将历史 **前 seq_len 步**（与多尺度里「细粒度」段对齐）传入内层基线，使可在同一次 run 中
+    对比「全量多尺度 SimDiff」与「仅原始步长」的两基线。
+    """
+
+    def __init__(self, inner: nn.Module, seq_len: int):
+        super().__init__()
+        self.inner = inner
+        self.seq_len = int(seq_len)
+
+    def forward(self, hist: torch.Tensor) -> torch.Tensor:
+        lh = int(hist.shape[1])
+        if lh > self.seq_len:
+            hist = hist[:, : self.seq_len, :].contiguous()
+        elif lh < self.seq_len:
+            raise ValueError(
+                f"BaselineHistTrim: hist_len={lh} < seq_len={self.seq_len}"
+            )
+        return self.inner(hist)
+
+
 def fit_regression_model(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,

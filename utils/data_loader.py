@@ -32,11 +32,15 @@ def _concat_multiscale_history(
 
 
 def resolve_temperature_column_name(feature_names: list[str]) -> str:
-    """在 weather表头中定位气温列名（与 main 中逻辑一致）。"""
+    """在表头中定位主预测列（与 main 一致）：优先气温别名，其次 ETT 等数据集常用目标列 OT。"""
     for key in ("T (degC)", "T(degC)", "temp", "temperature"):
         for name in feature_names:
             if name.strip().lower() == key.lower():
                 return name
+    # ETT hourly/ETTm 等：<...>,HUFL,...,OT
+    for name in feature_names:
+        if name.strip() == "OT":
+            return name
     for name in feature_names:
         n = name.lower()
         if "degc" in n and "tlog" not in n and "tpot" not in n and n.strip().startswith("t"):

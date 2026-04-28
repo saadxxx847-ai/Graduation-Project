@@ -31,10 +31,10 @@ class Config:
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # 滑动窗口起点 i 的最小值（相对各自划分后的序列）；用于与多尺度所需向左上下文对齐。
-    # 多尺度融合需要 anchor 前至少 672 步，故 i>=576；单模型开 multiscale 时默认会设为 576。
+    # 多尺度融合需要 anchor 前至少 672 步，故 i>=576；开 multiscale 时 make_loaders 会把下界抬到 576。
     hist_window_start_min: int = 0
-    # True：历史输入为 [96 小时温 | 7 日均值 | 4 周均值] 共 seq_len+11 步拼接（仅数据与 pos_h 加长，不改 Encoder 结构）
-    use_multiscale_hist: bool = False
+    # True：历史为 [seq_len 原始 | 7×日均值 | 4×周均值] 共 seq_len+11 步拼接（默认开；见 main --single_scale_hist 关闭）
+    use_multiscale_hist: bool = True
 
     input_dim: int = -1
     # 略增宽深：RMSNorm vs LayerNorm 的差异在大一点的 Transformer 上更易体现（四组消融仍公平）
@@ -46,7 +46,7 @@ class Config:
     # True：嵌入后、注意力前对 (B,L,d) 做 RevIn，encoder 出未来段后再反归一
     # True：自注意力+FFN 的预归一化用 RMSNorm 替代 nn.TransformerEncoder 内的 LayerNorm
     # True（且 use_revin=False）：嵌入后仅加性历史偏置（HistoryAdditiveBias），见 models.revin_rms.HistoryAdditiveBias
-    use_revin: bool = True
+    use_revin: bool = False
     use_rmsnorm: bool = True
     use_hist_add_bias: bool = False
     # HistoryAdditiveBias 外层 scale；与 RMS 堆栈同开时默认更弱（见 hist_add_bias_scale_with_rmsnorm）

@@ -916,3 +916,77 @@ python scripts/plot_pred_len_simdiff_vs_itrans.py \
 ```
 
 ---
+
+## 2026-04-28：ETTh1 单变量 OT 预测、毕设图写入 `ETTh1/`、与 weather 权重的关系
+
+### 数据
+
+- 文件：`data/ETTh1.csv`；默认 **`temperature_only=True` 时只取 `OT` 列**（与 weather 只取 `T (degC)` 对称）。实现：`utils/data_loader.resolve_temperature_column_name` 在未匹配气温别名后回落到列名 **`OT`**；`main.resolve_temperature_feature_index` 在多变量表中对 `OT` 解析索引。
+- **不要**在未改代码时用 `--all_features` 却仍想「只评 OT」——除非全开列并手动约定目标通道。
+
+### CLI 扩展（`main.py`）
+
+| 参数 | 作用 |
+|------|------|
+| **`--data_path`** | 指定相对项目根的 CSV（例 `data/ETTh1.csv`），换数据集等价于改 `Config.data_path`。 |
+| **`--figures_dir`** | 毕设柱状图（`bar_mae_mse_*`）与 **forecast overlay**（`forecast_curves_*`）写入 **`<项目根>/<figures_dir>/`**；不传则仍为 **`result/<数据文件 stem>/`**（如 `result/ETTh1/`）。两者二选一即可；若希望和旧 `weather` 目录完全并排、又避免与 `result/ETTh1` 混名，可把图统一 export 到顶层的 **`ETTh1/`** 文件夹（见下文命令）。 |
+
+### 与 iTransformer / TimeMixer 同图对比的训练命令
+
+学习型基线在 **`use_multiscale_hist=False`** 时才会跑（history 长度为 `seq_len=96`，与基线架构一致）。**不要**同时使用 **`--multiscale_hist`** 或 **`--ms_rms_ablation`** 来期待同一条 main 里出现 iTransformer/TimeMixer——多尺度历史下 main 会跳过基线（见终端 `[note] use_multiscale_hist...`）；`ms_rms` 套件则是四柱 SimDiff 消融，不带 iTransformer/TimeMixer。
+
+在一台机上从 **weather** 换到 **ETTh1** 时，**务必**指定 **checkpoint 后缀**，避免覆盖 **`simdiff_weather_best.pt`** 等文件名：
+
+```bash
+python main.py --data_path data/ETTh1.csv --figures_dir ETTh1 \
+  --ckpt_extra_suffix _etth1_ot --epochs 50
+```
+
+完成后会得到：
+
+- **`ETTh1/`**（或你选择的名字）下的 **`bar_mae_mse_temperature_<时间戳>.png`** 与 `forecast_curves_temperature_overlay_<时间戳>.png`；
+- **终端**：`utils/result_output.print_thesis_metrics_table`，含 **SimDiff** 与 **iTransformer / TimeMixer** 的 **MAE、MSE、CRPS、VAR**（点预测两行：CRPS=MAE；VAR=0，与既有 weather 约定一致）。
+
+仅评估（已训好 **`…_etth1_ot.pt`** 且基线在内存中会重训——见下）：
+
+```bash
+python main.py --data_path data/ETTh1.csv --figures_dir ETTh1 \
+  --ckpt_extra_suffix _etth1_ot --eval_only
+```
+
+当前实现下 **`--skip_baselines` 未传**时，**iTransformer / TimeMixer** 在每次运行（含 `eval_only`）会从数据 **重新训练**到早停——没有单独保存基线权重；若需「只评 SimDiff、跳过基线」，加 **`--skip_baselines`**。
+
+### 能否直接加载 **weather** 上训好的 SimDiff 权重？
+
+**不建议作为最终报告结果，仅可作 smoke test。**
+
+- 单通道时 **张量形状**与 ETTh1(OT) 一致，**可能能 load 进网络**；但 **RevIn 缓冲、未来边际统计、数据分布**均针对 weather，**指标与曲线通常不可信**。
+- 正式对比：应在 **ETTh1 上重新训练**（或至少在该集上 **微调**），并使用 **`--ckpt_extra_suffix`** 保留 **weather** 与 **ETTh1** 两套 `pt`。
+
+### 产出文件示例（文件名带默认时间戳后缀）
+
+- `ETTh1/bar_mae_mse_temperature_<suffix>.png` — SimDiff vs 基线 MAE/MSE 柱图。
+- `ETTh1/forecast_curves_temperature_overlay_<suffix>.png` — 真值 + 多模型预测折线叠加（批量 0）。
+
+---
+
+## 2026-04-29：`Config` 默认 SimDiff：**RevIn 关、RMSNorm 开、多尺度历史开**
+
+- **`config/config.py`**：`use_revin=False`，`use_rmsnorm=True`，`use_multiscale_hist=True`。
+- **`main.py`**：新增 **`--revin`**（临时开 RevIn）；**`--single_scale_hist`** 关闭多尺度（恢复 96 步历史，可与 iTransformer/TimeMixer 同跑学习型基线）。**`--multiscale_hist`** 仍可显式开多尺度（默认已与 Config 一致）。**`--no_revin`** 显式关闭 RevIn（若与 **`--revin`** 同时传，以 **`--no_revin`** 为准）。
+- **`_clear_ms_rms_key` / RevIn·RMS 消融段结束时的 cfg** 与新版默认对齐（RevIn 关、RMSNorm 开、恢复多尺度开）。
+- **注意（已部分替代，见下一条）**：若需 **SimDiff 与基线同一历史长度（均 96 步）** 的严格对照，仍可用 **`--single_scale_hist`**；多尺度全开时请看「多尺度 SimDiff + 基线」一条。
+
+---
+
+## 2026-04-29：`plot_forecast_compare` 横轴与多尺度 history（future 起点 bug）
+
+- **现象**：多尺度时 `hist` 长度为 `seq_len+11`，但若 `t_fut` 仍从 `seq_len` 起算，真值会与 history 在 **x=seq_len … ehl-1** 上重叠，且 `compare_viz` 中 **history 末点 ↔ 真值首点** 连接线会在 x 轴 **折返**（看起来像 ground truth「扭到虚线左边」）。
+- **修复**：`main.forecast_overlay_time_axes(cfg)` 统一为 `t_hist = 0..ehl-1`、`t_fut = ehl .. ehl+Lf-1`，`ehl = effective_hist_len()`；毕设 overlay、`run_revin_rms_ablation_suite` 叠图、以及 `forecast_example.png` 分界线 **（`axvline(ehl-0.5)`）** 一并改正。
+
+## 2026-04-29：多尺度 SimDiff 与同 run 训练 iTransformer / TimeMixer
+
+- **做法**：数据层多尺度历史中，前 `seq_len` 步为原始分辨率段（与旧时单尺度一致）；基线仅消费 **`hist[:, :seq_len, :]`**，SimDiff 仍消费全长 `seq_len+11`。**`utils/baselines.BaselineHistTrim`** + **`main.py`** 中学习型基线在 `use_multiscale_hist=True` 时自动外包一层。
+- **含义**：两条基线在信息上 **弱于** 全量多尺度 SimDiff（公平性说明写进 `[note]` 终端提示）；若希望基线也得到「整段上下文」量级，需在架构上重做基线或使用 **`--single_scale_hist`** 做「人人 96 步」的另一套对照。
+
+---

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 SimDiff-Weather 主入口：默认 **先训练再评估**。
-默认仅使用气温 `T (degC)` 单变量序列；`--all_features` 可恢复多变量。
+默认仅使用气温 `T (degC)` 或 ETT 的 `OT` 单变量；`--all_features` 可恢复多变量。
+默认去噪器：**RMSNorm 开、RevIn 关、多尺度历史融合开**（`--revin` / `--single_scale_hist` 可改）。
 使用 `--eval_only` 将 **跳过训练** 并加载已有权重——若从未训练，指标无意义。
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ if str(ROOT) not in sys.path:
 from config.config import Config
 from models.simdiff import SimDiffWeather, point_prediction_from_forecast
 from utils.baselines import (
+    BaselineHistTrim,
     BaselineTimeMixer,
     BaselineiTransformer,
     collect_channel_residuals,
@@ -80,7 +82,7 @@ def collect_test_forecast_errors(
 
 
 def resolve_temperature_feature_index(feat_names: list[str]) -> int:
-    """单变量气温时恒为 0；多变量时解析气温列索引。"""
+    """单变量预测时恒为 0；多变量时解析气温列或目标列 OT 的索引。"""
     if len(feat_names) == 1:
         return 0
     for key in ("T (degC)", "T(degC)", "temp", "temperature"):
@@ -91,7 +93,32 @@ def resolve_temperature_feature_index(feat_names: list[str]) -> int:
         n = name.lower()
         if "degc" in n and "tlog" not in n and "tpot" not in n and n.strip().startswith("t"):
             return i
+    for i, name in enumerate(feat_names):
+        if name.strip() == "OT":
+            return i
     return min(1, len(feat_names) - 1)
+
+
+def resolved_thesis_plot_dir(cfg: Config, args: argparse.Namespace | None) -> Path:
+    """毕设柱状图 / forecast overlay 目录：可由 --figures_dir 定向到项目根下任意子文件夹。"""
+    if args is not None:
+        fd = getattr(args, "figures_dir", None)
+        if fd is not None and str(fd).strip():
+            p = cfg.project_root / str(fd).strip().strip("/\\")
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+    return cfg.resolved_result_dir()
+
+
+def forecast_overlay_time_axes(cfg: Config) -> tuple[np.ndarray, np.ndarray]:
+    """
+    与 compare_viz.plot_forecast_compare 配合：**必须先铺满整块 conditioning**，再给 future。
+    多尺度时 hist 长度为 seq_len+11，`future 的起点必须为 effective_hist_len**，不能用 seq_len，
+    否则真值/预测会与历史中后部在日轴时间上错位重叠。
+    """
+    ehl = int(cfg.effective_hist_len())
+    pl = int(cfg.pred_len)
+    return np.arange(ehl), np.arange(ehl, ehl + pl)
 
 
 @torch.no_grad()
@@ -297,9 +324,9 @@ def _clear_ms_rms_key(cfg: Config) -> None:
     cfg.denoiser_variant = None
     cfg.ablation_ckpt_suite = None
     cfg.use_hist_add_bias = False
-    cfg.use_multiscale_hist = False
+    cfg.use_multiscale_hist = True
     cfg.hist_window_start_min = 0
-    cfg.use_revin = True
+    cfg.use_revin = False
     cfg.use_rmsnorm = True
 
 
@@ -340,7 +367,7 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
         raise ValueError(
             "ms_rms_ablation 仅支持 simdiff_ablation=full；mom_only/ni_only 仍用原有单模型流程"
         )
-    rdir = cfg.resolved_result_dir()
+    rdir = resolved_thesis_plot_dir(cfg, args)
     ckpt_dir = cfg.resolved_checkpoint_dir()
     ms_rms_only = _parse_ms_rms_only_arg(getattr(args, "ms_rms_only", None))
 
@@ -561,7 +588,7 @@ def run_revin_rms_ablation_suite(
         " ".join(cfg.result_dataset_slug().split()), ascii_fallback="dataset"
     )
     slug = " ".join(cfg.result_dataset_slug().split())
-    rdir = cfg.resolved_result_dir()
+    rdir = resolved_thesis_plot_dir(cfg, args)
     ckpt_dir = cfg.resolved_checkpoint_dir()
 
     for key, _ in _REVIN_RMS_ABLATION_SPECS:
@@ -606,8 +633,7 @@ def run_revin_rms_ablation_suite(
     hb1, fb1 = next(iter(test_loader))
     hb1 = hb1.to(device)
     fb1 = fb1.to(device)
-    t_hist = np.arange(cfg.seq_len)
-    t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
+    t_hist, t_fut = forecast_overlay_time_axes(cfg)
 
     for key, label in _REVIN_RMS_ABLATION_SPECS:
         _apply_denoiser_ablation_key(cfg, key)
@@ -658,7 +684,7 @@ def run_revin_rms_ablation_suite(
             torch.cuda.empty_cache()
 
     _clear_denoiser_ablation_key(cfg)
-    cfg.use_revin, cfg.use_rmsnorm = True, True
+    cfg.use_revin, cfg.use_rmsnorm = False, True
 
     print_thesis_metrics_table(
         table_rows,
@@ -740,12 +766,32 @@ def main() -> None:
     parser.add_argument(
         "--all_features",
         action="store_true",
-        help="使用 weather.csv 全部数值列（默认仅气温单变量）",
+        help="使用 CSV 全部数值列（默认仅单目标列：气温列名或 ETT 的 OT）",
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default=None,
+        metavar="CSV",
+        help="相对项目根的数据文件路径（例 data/ETTh1.csv）；默认 Config.data_path",
+    )
+    parser.add_argument(
+        "--figures_dir",
+        type=str,
+        default=None,
+        metavar="REL_DIR",
+        help="毕设柱状图与 forecast overlay 写入 <项目根>/<REL_DIR>/（例 ETTh1）；"
+        "不写则仍为 result/<数据文件 stem>/",
     )
     parser.add_argument(
         "--multiscale_hist",
         action="store_true",
-        help="单模型训练：历史输入为 96h 原始 + 7 日均值 + 4 周均值拼接（共 107 token），需更长向左上下文",
+        help="显式开启多尺度历史拼接（Config 默认已开启；与 --single_scale_hist 冲突时以后者为准）",
+    )
+    parser.add_argument(
+        "--single_scale_hist",
+        action="store_true",
+        help="关闭多尺度拼接，仅 seq_len 步原始历史（与 iTransformer/TimeMixer 长度一致，便于同训基线）",
     )
     parser.add_argument(
         "--seq_len",
@@ -915,9 +961,14 @@ def main() -> None:
         help="已弃用：等价于 --ms_rms_reuse_rmsnorm_ckpt",
     )
     parser.add_argument(
+        "--revin",
+        action="store_true",
+        help="单次训练开启去噪器 RevIn（默认关闭；与 --revin_rms_ablation 互斥于后者内部设定）",
+    )
+    parser.add_argument(
         "--no_revin",
         action="store_true",
-        help="单次训练关闭去噪器 RevIn（与 --revin_rms_ablation 互斥于后者内部设定）",
+        help="单次训练关闭 RevIn（默认已关；显式与 --revin 抵触时以本项为准）",
     )
     parser.add_argument(
         "--no_rmsnorm",
@@ -963,6 +1014,8 @@ def main() -> None:
         parser.error("--revin_rms_ablation 与 --ms_rms_ablation（含弃用的 --dual_ablation）不能同时使用")
 
     cfg = Config()
+    if getattr(args, "data_path", None) and str(args.data_path).strip():
+        cfg.data_path = str(args.data_path).strip()
     if args.hist_add_bias_scale is not None:
         cfg.hist_add_bias_scale = float(args.hist_add_bias_scale)
     if args.hist_add_bias_scale_with_rmsnorm is not None:
@@ -971,6 +1024,8 @@ def main() -> None:
         cfg.temperature_only = False
     if getattr(args, "multiscale_hist", False):
         cfg.use_multiscale_hist = True
+    if getattr(args, "single_scale_hist", False):
+        cfg.use_multiscale_hist = False
     if args.epochs is not None:
         cfg.epochs = args.epochs
     if getattr(args, "ms_rms_baseline_epochs", None) is not None:
@@ -1012,6 +1067,8 @@ def main() -> None:
     if not args.revin_rms_ablation:
         if args.no_revin:
             cfg.use_revin = False
+        elif getattr(args, "revin", False):
+            cfg.use_revin = True
         if args.no_rmsnorm:
             cfg.use_rmsnorm = False
     if args.revin_rms_ablation:
@@ -1151,7 +1208,10 @@ def main() -> None:
         f"use_ema={cfg.use_ema}（decay={cfg.ema_decay}，checkpoint 存 EMA）"
     )
     mode = "仅气温单变量" if cfg.temperature_only else "全部气象变量"
-    print(f"特征维度 C={n_features}（{mode}）, 列: {feat_names}")
+    print(
+        f"特征维度 C={n_features}（{mode}）, 列: {feat_names} | "
+        f"RevIn={cfg.use_revin}, RMSNorm={cfg.use_rmsnorm}, multiscale_hist={cfg.use_multiscale_hist}"
+    )
     print(
         f"Normalization Independence: 历史/未来分算 μ,σ；"
         f"无真值反变换用训练集未来边际 std范围 "
@@ -1343,9 +1403,7 @@ def main() -> None:
     plot_dir = cfg.resolved_plot_dir()
     c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
     ylabel = feat_names[c_vis] if c_vis < len(feat_names) else str(c_vis)
-    _ehl = int(cfg.effective_hist_len())
-    t_hist = np.arange(_ehl)
-    t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
+    t_hist, t_fut = forecast_overlay_time_axes(cfg)
 
     if not cfg.thesis_result_only and not args.skip_denoise_traj:
         hd0, fd0 = next(iter(test_loader))
@@ -1386,14 +1444,16 @@ def main() -> None:
     bar_maes: list[float] = [float(mae_ch[t_idx])]
     bar_mses: list[float] = [float(mse_ch[t_idx])]
 
-    itrans_m: BaselineiTransformer | None = None
-    tmixer_m: BaselineTimeMixer | None = None
+    itrans_m: BaselineHistTrim | BaselineiTransformer | None = None
+    tmixer_m: BaselineHistTrim | BaselineTimeMixer | None = None
     residual_multi_for_kde: dict[str, np.ndarray] | None = None
 
-    run_learned_baselines = not args.skip_baselines and not cfg.use_multiscale_hist
-    if cfg.use_multiscale_hist and not args.skip_baselines:
+    run_learned_baselines = not args.skip_baselines
+
+    if run_learned_baselines and cfg.use_multiscale_hist:
         print(
-            "[note] use_multiscale_hist 下历史序列长于 96；iTransformer/TimeMixer 固定 seq_len=96，已跳过学习型基线。"
+            f"[note] 多尺度历史下 iTransformer/TimeMixer 仅使用前 {cfg.seq_len} 步原始段；"
+            f"SimDiff 仍用全量 {cfg.effective_hist_len()} 步。"
         )
 
     if run_learned_baselines:
@@ -1406,7 +1466,7 @@ def main() -> None:
         pl, sl, C = cfg.pred_len, cfg.seq_len, n_features
         amp_on = bool(cfg.forecast_amp)
 
-        itrans_m = BaselineiTransformer(
+        itrans_core = BaselineiTransformer(
             sl,
             pl,
             C,
@@ -1415,6 +1475,7 @@ def main() -> None:
             num_layers=cfg.baseline_itransformer_layers,
             dropout=cfg.dropout,
         )
+        itrans_m = BaselineHistTrim(itrans_core, sl) if cfg.use_multiscale_hist else itrans_core
         itrans_m = fit_regression_model(
             itrans_m,
             train_loader,
@@ -1448,7 +1509,7 @@ def main() -> None:
         bar_maes.append(float(at_b))
         bar_mses.append(float(mt_b))
 
-        tmixer_m = BaselineTimeMixer(
+        tmixer_core = BaselineTimeMixer(
             sl,
             pl,
             C,
@@ -1456,6 +1517,7 @@ def main() -> None:
             n_scales=cfg.baseline_timemixer_scales,
             dropout=cfg.dropout,
         )
+        tmixer_m = BaselineHistTrim(tmixer_core, sl) if cfg.use_multiscale_hist else tmixer_core
         tm_lr = (
             float(cfg.baseline_timemixer_lr)
             if cfg.baseline_timemixer_lr is not None
@@ -1632,7 +1694,7 @@ def main() -> None:
         plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
         plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="black")
         plt.plot(t_fut, pred0[:, c_vis], label=_sdn, color="C2", linestyle="--")
-        plt.axvline(cfg.seq_len - 0.5, color="gray", linestyle=":")
+        plt.axvline(int(cfg.effective_hist_len()) - 0.5, color="gray", linestyle=":")
         plt.xlabel("time step (index)")
         plt.ylabel(ylabel)
         plt.title("SimDiff-Weather: forecast (single model)")
@@ -1643,8 +1705,8 @@ def main() -> None:
         plt.close()
         print(f"Saved plot: {plot_path}")
 
-    # -------- 毕设专用：result/<数据集名>/，与 plots/ 隔离；温度主变量指标与曲线 --------
-    rdir = cfg.resolved_result_dir()
+    # -------- 毕设专用：result/<数据集名>/ 或 --figures_dir；与 plots/ 隔离；主变量指标与曲线 --------
+    rdir = resolved_thesis_plot_dir(cfg, args)
     ch = t_idx
     slug = " ".join(cfg.result_dataset_slug().split())
     crps_mean_t = crps_mean_fulltest
