@@ -12,7 +12,7 @@ import torch.nn as nn
 class RMSNorm(nn.Module):
     """RMS 归一化：仅对最后一维用均方根缩放，无均值去中心化。兼容 torch>=2.0 且无 nn.RMSNorm 时亦可使用。"""
 
-    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+    def __init__(self, dim: int, eps: float = 1e-4) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
@@ -31,7 +31,7 @@ class RevINPatch(nn.Module):
     前向用 norm 模式；在 encoder 后对未来段用「与 norm 时同一前向中保存的」统计量做 denorm。该用法与多数量预测代码库中「骨干输出再反归一」一致，便于在潜空间与 out_proj 衔接。
     """
 
-    def __init__(self, d_model: int, eps: float = 1e-5, affine: bool = True) -> None:
+    def __init__(self, d_model: int, eps: float = 1e-4, affine: bool = True) -> None:
         super().__init__()
         self.d_model = d_model
         self.eps = eps
@@ -123,3 +123,26 @@ class DenoiserEncoderLayerRMSPre(nn.Module):
         )
         x = x + self._ff_block(self.rms2(x))
         return x
+
+
+class HistoryAdditiveBias(nn.Module):
+    """
+    仅用历史段 token 均值经小 MLP 得到与 d_model 同维偏置，broadcast 加到整段 concat(hist,fut) 上：
+    seq <- seq + scale * MLP(mean(hist_emb))。无乘项，末层零初始化使训练初期近似恒等。
+    """
+
+    def __init__(self, d_model: int, scale: float = 0.12) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+        self.scale = float(scale)
+        self.mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, seq: torch.Tensor, hist_tokens: int) -> torch.Tensor:
+        ht = int(hist_tokens)
+        if ht <= 0:
+            return seq
+        g = seq[:, :ht, :].mean(dim=1)
+        b = self.mlp(g).unsqueeze(1)
+        return seq + self.scale * b

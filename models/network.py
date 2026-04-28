@@ -2,7 +2,7 @@
 条件去噪网络：历史与未来 token 拼接，时间步正弦嵌入 + Transformer 编码，
 输出与未来序列同形状的预测噪声 eps。
 
-默认：在 token 嵌入后插入 RevIn（可逆）、Transformer 子层中 LayerNorm 换为 RMSNorm；数据层的 NI 仍在 IndependentNormalizer 中独立执行。
+默认：可在 token 嵌入后插入 RevIn（可逆）或 HistoryAdditiveBias（历史池化→仅加性偏置）；Transformer 子层可调 LayerNorm 换 RMSNorm；NI 仍在 IndependentNormalizer 中。
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn as nn
 
-from models.revin_rms import DenoiserEncoderLayerRMSPre, RevINPatch
+from models.revin_rms import DenoiserEncoderLayerRMSPre, HistoryAdditiveBias, RevINPatch
 
 
 class DenoiserTransformer(nn.Module):
@@ -26,6 +26,8 @@ class DenoiserTransformer(nn.Module):
         dropout: float = 0.1,
         use_revin: bool = True,
         use_rmsnorm: bool = True,
+        use_hist_add_bias: bool = False,
+        hist_add_bias_scale: float = 0.12,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -34,6 +36,9 @@ class DenoiserTransformer(nn.Module):
         self.d_model = d_model
         self.use_revin = use_revin
         self.use_rmsnorm = use_rmsnorm
+        self.use_hist_add_bias = use_hist_add_bias
+        if use_revin and use_hist_add_bias:
+            raise ValueError("use_revin 与 use_hist_add_bias 不能同时为 True")
 
         self.in_proj = nn.Linear(channels, d_model)
         half = d_model // 2
@@ -48,9 +53,16 @@ class DenoiserTransformer(nn.Module):
         self.pos_f = nn.Parameter(torch.zeros(1, pred_len, d_model))
 
         if use_revin:
-            self.revin = RevINPatch(d_model, eps=1e-5, affine=True)
+            # eps 略大：短序列/小 batch 时实例 σ 更稳，利 RevIn 收敛
+            self.revin = RevINPatch(d_model, eps=1e-4, affine=True)
         else:
             self.revin = None  # type: ignore[assignment]
+
+        self.hist_add_bias: HistoryAdditiveBias | None
+        if use_hist_add_bias:
+            self.hist_add_bias = HistoryAdditiveBias(d_model, scale=float(hist_add_bias_scale))
+        else:
+            self.hist_add_bias = None
 
         if use_rmsnorm:
             self.encoder = self._build_rms_encoder(
@@ -122,6 +134,8 @@ class DenoiserTransformer(nn.Module):
         seq = torch.cat([h, f], dim=1)
         if self.use_revin and self.revin is not None:
             seq = self.revin.forward_norm(seq)
+        elif self.hist_add_bias is not None:
+            seq = self.hist_add_bias(seq, self.seq_len)
         out = self._encode(seq)
         out_f = out[:, self.seq_len :, :]
         if self.use_revin and self.revin is not None:

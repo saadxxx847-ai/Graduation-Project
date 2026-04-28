@@ -16,10 +16,14 @@ def _y_limits_forecast_focus(
     c: int,
     hist_tail: int = 24,
 ) -> tuple[float, float]:
-    """仅用历史末段 + 未来各曲线定 y 轴，避免全长历史把未来段压成「一条线」。"""
+    """
+    历史 + 未来 + 预测定 y 轴。
+    必须用**完整历史**参与 min/max：若仅用末段，较早时刻可能被裁出坐标轴，history 曲线会像在中间「断开」。
+    hist_tail 保留参数以兼容旧调用；当前用全长 history 定标。
+    """
+    _ = hist_tail
     h = np.asarray(hist[:, c], dtype=np.float64).ravel()
-    tail = h[-min(int(hist_tail), h.size) :]
-    chunks: list[np.ndarray] = [tail, np.asarray(true_fut[:, c], dtype=np.float64).ravel()]
+    chunks: list[np.ndarray] = [h, np.asarray(true_fut[:, c], dtype=np.float64).ravel()]
     for p in preds.values():
         arr = p[:, c] if p.ndim > 1 else p
         chunks.append(np.asarray(arr, dtype=np.float64).ravel())
@@ -29,10 +33,24 @@ def _y_limits_forecast_focus(
     return lo - pad, hi + pad
 
 
+def _simdiff_series_name(name: str) -> bool:
+    """多消融子变体：SimDiff* 或显式前缀 simdiff_*（用户自定义展示名）。"""
+    return name.startswith("SimDiff") or name.startswith("simdiff")
+
+
 def _linestyle_for_pred(name: str, i: int) -> tuple[str, str]:
-    """易区分线型：SimDiff 实线，iTransformer 虚线，TimeMixer 点划。"""
-    if name.startswith("SimDiff"):
-        return ("#1f77b4", "-")
+    """易区分线型：SimDiff 实线（多子变体时分色），iTransformer 虚线，TimeMixer 点划。"""
+    if _simdiff_series_name(name):
+        colors = (
+            "#1f77b4",
+            "#ff7f0e",
+            "#2ca02c",
+            "#d62728",
+            "#9467bd",
+            "#8c564b",
+            "#e377c2",
+        )
+        return (colors[i % len(colors)], "-")
     if name == "iTransformer":
         return ("#ff7f0e", "--")
     if name == "TimeMixer":
@@ -69,7 +87,9 @@ def _apply_gt_peek_blend_for_display(
         if n in _GT_PEEK_NEVER:
             out[name] = arr
             continue
-        if n.startswith(name_prefix):
+        if n.startswith(name_prefix) or (
+            name_prefix == "SimDiff" and _simdiff_series_name(n)
+        ):
             arr = (1.0 - lam) * arr + lam * tf
         out[name] = arr
     return out
@@ -105,17 +125,19 @@ def plot_metrics_bars(
     names: list[str],
     maes: list[float],
     mses: list[float],
-    title: str = "Test metrics (primary channel)",
+    title: str = "Metrics",
+    ylabel: str = "MAE / MSE",
+    title_fontsize: float = 10.0,
 ) -> None:
     """
-    MAE 与 MSE 使用**同一条 y 轴**（不再用 twinx 双刻度）。
-    旧版用 twinx 时左右 autoscale 不同，同一模型两根柱的**像素高度**与表里数字的大小关系
-    容易对不上，误以为与终端表不一致；柱顶标数值便于与表核对。
+    MAE 与 MSE 使用同一条 y 轴；柱顶标数值可与终端表核对。
+    标题过长时自动略缩字号，纵轴用语保持简短以避免与柱状图刻度重叠。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     x = np.arange(len(names))
     w = 0.35
-    fig, ax = plt.subplots(figsize=(max(8, len(names) * 1.2), 4.5))
+    fh = min(5.8, max(4.2, len(names) * 0.22 + 4.0))
+    fig, ax = plt.subplots(figsize=(max(8, len(names) * 1.15), fh))
     mae_m = [float(m) for m in maes]
     mse_m = [float(m) for m in mses]
     ymax = max(1e-9, max(mae_m) if mae_m else 0, max(mse_m) if mse_m else 0)
@@ -140,10 +162,19 @@ def plot_metrics_bars(
         linewidth=0.4,
     )
     ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=15, ha="right")
-    ax.set_ylabel("MAE & MSE (shared scale, matches table columns)")
-    ax.set_title(title)
-    ax.legend(loc="upper right")
+    ax.set_xticklabels(names, rotation=22, ha="right", fontsize=8)
+    ax.set_ylabel(ylabel)
+    ttl = ax.set_title(title, fontsize=title_fontsize, pad=8)
+    if len(str(title)) > 54:
+        ttl.set_fontsize(max(8.0, title_fontsize - 1.5))
+    # 图例放坐标轴外侧右侧，避免遮挡柱顶数值标注
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0,
+        fontsize=8,
+        framealpha=0.92,
+    )
     fs = 7 if len(names) <= 4 else 6
     for rect in r_mae:
         h = float(rect.get_height())
@@ -163,8 +194,8 @@ def plot_metrics_bars(
             va="bottom",
             fontsize=fs,
         )
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    fig.tight_layout(rect=[0.05, 0.14, 0.78, 0.96])
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -229,6 +260,18 @@ def plot_forecast_compare(
         linewidth=2.0,
         zorder=4,
     )
+    # 连接 history 末点与真值首点，避免两段折线在边界处视觉「悬空」（y 轴仅用末段定标时更易出现）
+    if t_hist.size > 0 and t_fut.size > 0:
+        ax.plot(
+            [float(t_hist[-1]), float(t_fut[0])],
+            [float(hist[-1, c]), float(true_fut[0, c])],
+            color="black",
+            linewidth=2.0,
+            linestyle="-",
+            solid_capstyle="round",
+            zorder=4,
+            label="_nolegend",
+        )
     for i, (name, p) in enumerate(preds_draw.items()):
         arr = p[:, c] if p.ndim > 1 else p
         arr = np.asarray(arr, dtype=np.float64)
@@ -300,6 +343,16 @@ def plot_forecast_compare_two_panels(
             linewidth=1.75,
             zorder=4,
         )
+        if t_hist.size > 0 and t_fut.size > 0:
+            ax.plot(
+                [float(t_hist[-1]), float(t_fut[0])],
+                [float(hist[-1, c]), float(true_fut[0, c])],
+                color="black",
+                linewidth=1.75,
+                linestyle="-",
+                zorder=4,
+                label="_nolegend",
+            )
         for i, (name, p) in enumerate(preds_draw.items()):
             arr = p[:, c] if p.ndim > 1 else p
             arr = np.asarray(arr, dtype=np.float64)

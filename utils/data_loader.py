@@ -12,6 +12,24 @@ from torch.utils.data import DataLoader, Dataset
 
 from config.config import Config
 
+# 多尺度：168=7×24（日窗），672=4×168（周窗）；需在窗口起点 i 之前保留足够上下文 → i>=576
+_MULTISCALE_PREFIX = 672 - 96
+
+
+def _concat_multiscale_history(
+    data: np.ndarray,
+    window_start: int,
+    seq_len: int,
+) -> np.ndarray:
+    """拼接 [seq_len 原始步 | 7×日平均 | 4×周平均]，shape (seq_len+11, C)。window_start 为当前样本历史起点 i。"""
+    anchor = window_start + seq_len
+    fine = data[window_start : window_start + seq_len]
+    blk168 = data[anchor - 168 : anchor]
+    daily = blk168.reshape(7, 24, -1).mean(axis=1)
+    blk672 = data[anchor - 672 : anchor]
+    weekly = blk672.reshape(4, 168, -1).mean(axis=1)
+    return np.concatenate([fine, daily, weekly], axis=0).astype(np.float32)
+
 
 def resolve_temperature_column_name(feature_names: list[str]) -> str:
     """在 weather表头中定位气温列名（与 main 中逻辑一致）。"""
@@ -29,26 +47,42 @@ def resolve_temperature_column_name(feature_names: list[str]) -> str:
 
 
 class WeatherWindowDataset(Dataset):
-    def __init__(self, data: np.ndarray, seq_len: int, pred_len: int):
+    def __init__(
+        self,
+        data: np.ndarray,
+        seq_len: int,
+        pred_len: int,
+        *,
+        multiscale: bool = False,
+        window_start_min: int = 0,
+    ):
         """
         data: (T, C) 全序列
+        window_start_min: 允许的最早窗口起点索引 i（相对本段 data 下标 0）。
+        multiscale: True 时历史为 seq_len+11 步拼接向量（仍为一通道标量每步）。
         """
         self.data = data.astype(np.float32)
         self.seq_len = seq_len
         self.pred_len = pred_len
-        self.n = len(data) - seq_len - pred_len + 1
+        self.multiscale = bool(multiscale)
+        self.window_start_min = int(window_start_min)
+        self.n = len(data) - seq_len - pred_len + 1 - self.window_start_min
         if self.n <= 0:
             raise ValueError(
-                f"序列太短：len={len(data)},需要至少 seq_len+pred_len={seq_len + pred_len}"
+                f"序列太短：len={len(data)},需要至少 seq_len+pred_len+window_start_min="
+                f"{seq_len + pred_len + self.window_start_min}"
             )
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        i = idx
-        hist = self.data[i : i + self.seq_len]
+        i = idx + self.window_start_min
         fut = self.data[i + self.seq_len : i + self.seq_len + self.pred_len]
+        if self.multiscale:
+            hist = _concat_multiscale_history(self.data, i, self.seq_len)
+        else:
+            hist = self.data[i : i + self.seq_len]
         return torch.from_numpy(hist), torch.from_numpy(fut)
 
 
@@ -103,6 +137,12 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
     T, C = matrix.shape
     cfg.input_dim = C
 
+    ms = bool(getattr(cfg, "use_multiscale_hist", False))
+    wmin = int(getattr(cfg, "hist_window_start_min", 0))
+    if ms:
+        wmin = max(wmin, _MULTISCALE_PREFIX)
+        cfg.hist_window_start_min = wmin
+
     train_end = int(T * cfg.train_ratio)
     val_end = int(T * (cfg.train_ratio + cfg.val_ratio))
 
@@ -110,9 +150,15 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
     val_mat = matrix[train_end:val_end]
     test_mat = matrix[val_end:]
 
-    train_ds = WeatherWindowDataset(train_mat, cfg.seq_len, cfg.pred_len)
-    val_ds = WeatherWindowDataset(val_mat, cfg.seq_len, cfg.pred_len)
-    test_ds = WeatherWindowDataset(test_mat, cfg.seq_len, cfg.pred_len)
+    train_ds = WeatherWindowDataset(
+        train_mat, cfg.seq_len, cfg.pred_len, multiscale=ms, window_start_min=wmin
+    )
+    val_ds = WeatherWindowDataset(
+        val_mat, cfg.seq_len, cfg.pred_len, multiscale=ms, window_start_min=wmin
+    )
+    test_ds = WeatherWindowDataset(
+        test_mat, cfg.seq_len, cfg.pred_len, multiscale=ms, window_start_min=wmin
+    )
 
     fut_mu, fut_sig = fit_future_marginal_stats(train_ds)
     cfg.train_future_marginal_mean = fut_mu
@@ -153,10 +199,12 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
         drop_last=False,
         **dl_common,
     )
+    tbs = cfg.test_batch_size if cfg.test_batch_size is not None else cfg.batch_size
+    dl_test = {**dl_common, "batch_size": int(tbs)}
     test_loader = DataLoader(
         test_ds,
         shuffle=False,
         drop_last=False,
-        **dl_common,
+        **dl_test,
     )
     return train_loader, val_loader, test_loader, C, names

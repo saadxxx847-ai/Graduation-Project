@@ -19,6 +19,8 @@ class Config:
     plot_dir: str = "plots"
     # 毕设结果图根目录；其下按数据集自动分子目录（见 resolved_result_dir），多数据集互不覆盖
     result_dir: str = "result"
+    # result/<数据集>/*.png 文件名后缀；main 启动时默认设为时间戳；--result_overwrite 时保持 None（旧文件名、可覆盖）
+    result_name_suffix: str | None = None
     # True：只写 result/<数据集>/ 与终端指标表，不保存 plots/ 下任何图（毕设精简输出）
     thesis_result_only: bool = True
     # 仅 overlay 作图、且**仅**名称以 SimDiff 开头者；(iTransformer/TimeMixer 不混合)：(1-λ)pred+λ·GT
@@ -28,17 +30,32 @@ class Config:
     pred_len: int = 24
     train_ratio: float = 0.70
     val_ratio: float = 0.15
+    # 滑动窗口起点 i 的最小值（相对各自划分后的序列）；用于与多尺度所需向左上下文对齐。
+    # 多尺度融合需要 anchor 前至少 672 步，故 i>=576；单模型开 multiscale 时默认会设为 576。
+    hist_window_start_min: int = 0
+    # True：历史输入为 [96 小时温 | 7 日均值 | 4 周均值] 共 seq_len+11 步拼接（仅数据与 pos_h 加长，不改 Encoder 结构）
+    use_multiscale_hist: bool = False
 
     input_dim: int = -1
-    d_model: int = 128
+    # 略增宽深：RMSNorm vs LayerNorm 的差异在大一点的 Transformer 上更易体现（四组消融仍公平）
+    d_model: int = 192
     n_heads: int = 4
-    n_layers: int = 3
+    n_layers: int = 4
     dropout: float = 0.1
     # 去噪器结构：与数据层 NI（IndependentNormalizer）正交
     # True：嵌入后、注意力前对 (B,L,d) 做 RevIn，encoder 出未来段后再反归一
     # True：自注意力+FFN 的预归一化用 RMSNorm 替代 nn.TransformerEncoder 内的 LayerNorm
+    # True（且 use_revin=False）：嵌入后仅加性历史偏置（HistoryAdditiveBias），见 models.revin_rms.HistoryAdditiveBias
     use_revin: bool = True
     use_rmsnorm: bool = True
+    use_hist_add_bias: bool = False
+    # HistoryAdditiveBias 外层 scale；与 RMS 堆栈同开时默认更弱（见 hist_add_bias_scale_with_rmsnorm）
+    hist_add_bias_scale: float = 0.12
+    hist_add_bias_scale_with_rmsnorm: float = 0.08
+    # 非 None 时 checkpoint 带后缀，如 simdiff_weather_best_full.pt（见 simdiff_checkpoint_filename）
+    denoiser_variant: str | None = None
+    # "dual"（旧 HistAdd 套件，仍兼容文件名）； "ms_rms"：多尺度 + RMSNorm 四组消融 → simdiff_weather_best_ms_rms_<...>.pt
+    ablation_ckpt_suite: str | None = None
 
     timesteps: int = 200
     cosine_s: float = 5.0
@@ -56,15 +73,21 @@ class Config:
     # 略加重：利於跟踪未来段陡变（重训后生效）；可退回 0.08 / 0.05
     training_noise_l1_weight: float = 0.10
     training_noise_temporal_diff_weight: float = 0.08
-    # 主噪声项 = α·MSE(ε̂,ε) + (1-α)·smooth_l1(ε̂,ε)（与气温无关）；α=1 与旧版纯 MSE 一致
-    training_noise_mse_huber_alpha: float = 1.0
+    # 主噪声项 = α·MSE(ε̂,ε) + (1-α)·smooth_l1(ε̂,ε)；α<1 略抑极端噪声、利尾部分布与 RevIn 稳定
+    training_noise_mse_huber_alpha: float = 0.92
     # smooth_l1 的 β（Huber 型分段阈）；仅当 α<1 时参与
     training_noise_huber_beta: float = 1.0
 
-    batch_size: int = 64
-    learning_rate: float = 3e-4
-    # 若 MAE 仍高于基线：可试更长训练、lr 2e-4，或增大 d_model / n_layers（须删 ckpt 重训）
+    # 更大 batch：序列维 RevIn 的实例方差估计更稳（显存不够可改回 64）
+    batch_size: int = 96
+    # 仅 test DataLoader 的 batch；None 时与 batch_size 相同。--eval_only 等仅跑测试时可设大以少迭代、加速
+    test_batch_size: int | None = None
+    # 略低于 3e-4：配合 RevIn 实例归一与更深网络，减少前期震荡
+    learning_rate: float = 2e-4
+    # 若 MAE 仍高于基线：可试更长训练、或微调 lr（须删 ckpt 重训）
     epochs: int = 50
+    # --ms_rms_ablation 时仅 baseline（原版 RevIn+RMS）使用的 epoch；其余三柱仍用 epochs
+    ms_rms_baseline_epochs: int = 30
     # >0 时预取+持久 worker，缩短数据等待；CPU/调试可设 0
     num_workers: int = 2
     # 训练阶段 CUDA 混合精度：通常明显加速、省显存，利于同样 wall-time 多跑几轮
@@ -73,7 +96,7 @@ class Config:
     use_ema: bool = True
     ema_decay: float = 0.9995
     seed: int = 42
-    early_stop_patience: int = 8
+    early_stop_patience: int = 10
     grad_clip_max_norm: float = 0.5
     z_clip: float = 4.0
 
@@ -88,9 +111,9 @@ class Config:
     # 仅 TimeMixer；为 None 时用 baseline_lr（略降如 5e-4 有时更稳）
     baseline_timemixer_lr: float | None = None
     baseline_grad_clip_max_norm: float = 1.0
-    baseline_timemixer_d_model: int = 128
+    baseline_timemixer_d_model: int = 192
     baseline_timemixer_scales: int = 3
-    baseline_itransformer_d_model: int = 128
+    baseline_itransformer_d_model: int = 192
     baseline_itransformer_nhead: int = 4
     baseline_itransformer_layers: int = 2
 
@@ -147,15 +170,60 @@ class Config:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    def effective_hist_len(self) -> int:
+        """去噪器历史 token 数：多尺度时为 seq_len+7+4，否则为 seq_len。"""
+        if getattr(self, "use_multiscale_hist", False):
+            return int(self.seq_len) + 11
+        return int(self.seq_len)
+
+    def result_png_basename(self, stem: str) -> str:
+        """
+        stem 为不含路径与扩展名的逻辑名，如 bar_mae_mse_temperature。
+        result_name_suffix 非空时返回 stem_<suffix>.png；为 None 时返回 stem.png（旧覆盖行为）。
+        """
+        s = stem.strip()
+        if s.lower().endswith(".png"):
+            s = s[:-4]
+        suf = self.result_name_suffix
+        if suf is not None and str(suf).strip() != "":
+            safe = (
+                str(suf)
+                .strip()
+                .replace(" ", "_")
+                .replace("/", "-")
+                .replace("\\", "-")
+            )
+            if not safe:
+                safe = "run"
+            return f"{s}_{safe}.png"
+        return f"{s}.png"
+
     def simdiff_checkpoint_filename(self) -> str:
         if self.simdiff_ablation == "mom_only":
-            return "simdiff_weather_best_mom_only.pt"
-        return "simdiff_weather_best.pt"
+            stem = "simdiff_weather_best_mom_only"
+        else:
+            stem = "simdiff_weather_best"
+        v = self.denoiser_variant
+        if v:
+            suite = getattr(self, "ablation_ckpt_suite", None)
+            if suite == "dual":
+                stem = f"{stem}_dual_{v}"
+            elif suite == "ms_rms":
+                stem = f"{stem}_ms_rms_{v}"
+            else:
+                stem = f"{stem}_{v}"
+        return f"{stem}.pt"
 
     def validate_simdiff_ablation(self) -> None:
         allowed = ("full", "ni_only", "mom_only")
         if self.simdiff_ablation not in allowed:
             raise ValueError(f"simdiff_ablation 须为 {allowed}，当前为 {self.simdiff_ablation!r}")
+
+    def validate_denoiser_embedding_options(self) -> None:
+        if bool(self.use_revin) and bool(self.use_hist_add_bias):
+            raise ValueError(
+                "use_revin 与 use_hist_add_bias 不能同时为 True；请关了 RevIn（use_revin=False）再开 HistoryAdditiveBias"
+            )
 
     def validate_mom_config(self) -> None:
         k, m = int(self.forecast_num_samples), int(self.mom_num_groups)

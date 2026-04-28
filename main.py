@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import random
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -46,12 +48,10 @@ from utils.compare_viz import (
     plot_residual_kde_multi,
     plot_training_curves,
 )
-from utils.prob_metrics import (
-    empirical_interval_coverage,
-    eval_crps_on_test,
-    mean_pred_sample_variance_on_test,
-)
-from utils.result_output import print_thesis_metrics_table
+from tqdm import tqdm
+
+from utils.prob_metrics import crps_ensemble_1d, empirical_interval_coverage
+from utils.result_output import print_metrics_ascii_table, print_thesis_metrics_table
 from utils.data_loader import make_loaders
 from utils.trainer import Trainer
 
@@ -127,6 +127,76 @@ def evaluate_test_loader(
     return mse_all, mae_all, mae_ch, mse_ch
 
 
+@torch.no_grad()
+def evaluate_test_loader_prob_combined(
+    model: SimDiffWeather,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    n_features: int,
+    temp_channel: int,
+    pred_len: int,
+    cfg: Config,
+    progress_desc: str | None = None,
+) -> tuple[float, float, np.ndarray, np.ndarray, float, float, np.ndarray]:
+    """
+    **单次**遍历测试集：`forecast(return_samples=True)` 一次算清
+    与 `evaluate_test_loader` 相同的 MAE/MSE、`temp_channel` 上 CRPS（均值 + 按步）、VAR。
+    避免对同一模型重复 K 次扩散采样（原先约 3× 墙钟）。
+    """
+    model.eval()
+    sum_sq = 0.0
+    sum_abs = 0.0
+    sum_sq_ch = torch.zeros(n_features, device=device)
+    sum_abs_ch = torch.zeros(n_features, device=device)
+    n_elem = 0
+    sum_crps = 0.0
+    n_crps = 0
+    sum_h = np.zeros(pred_len, dtype=np.float64)
+    n_h = np.zeros(pred_len, dtype=np.int64)
+    sum_var = 0.0
+    n_var = 0
+    loader = test_loader
+    if progress_desc:
+        # leave=True：每模型一条完整进度行；leave=False 在部分终端里下一轮 tqdm 会与上行碎片叠在同一行
+        loader = tqdm(
+            test_loader,
+            desc=progress_desc,
+            leave=True,
+            unit="batch",
+        )
+    for hist, fut in loader:
+        hist = hist.to(device)
+        fut = fut.to(device)
+        out = model.forecast(hist, future=fut, return_samples=True)
+        pred = point_prediction_from_forecast(out, cfg)
+        diff = pred - fut
+        sum_sq += float((diff**2).sum().item())
+        sum_abs += float(diff.abs().sum().item())
+        sum_sq_ch += (diff**2).sum(dim=(0, 1))
+        sum_abs_ch += diff.abs().sum(dim=(0, 1))
+        n_elem += diff.numel()
+        if out.samples is not None:
+            s = out.samples[..., temp_channel]
+            y = fut[..., temp_channel]
+            crps_bl = crps_ensemble_1d(s, y)
+            sum_crps += float(crps_bl.sum().item())
+            n_crps += crps_bl.numel()
+            sum_h += crps_bl.sum(dim=0).detach().cpu().numpy()
+            n_h += crps_bl.size(0)
+            v = s.var(dim=1, unbiased=False)
+            sum_var += float(v.sum().item())
+            n_var += v.numel()
+    mse_all = sum_sq / max(n_elem, 1)
+    mae_all = sum_abs / max(n_elem, 1)
+    steps = n_elem // max(n_features, 1)
+    mse_ch = (sum_sq_ch / max(steps, 1)).cpu().numpy()
+    mae_ch = (sum_abs_ch / max(steps, 1)).cpu().numpy()
+    mean_crps = sum_crps / max(n_crps, 1)
+    mean_var = sum_var / max(n_var, 1)
+    crps_h = sum_h / np.maximum(n_h, 1)
+    return mse_all, mae_all, mae_ch, mse_ch, mean_crps, mean_var, crps_h
+
+
 def simdiff_plot_name(cfg: Config) -> str:
     """图中/表中 SimDiff 曲线名称，区分消融。"""
     if cfg.simdiff_ablation == "full":
@@ -134,6 +204,464 @@ def simdiff_plot_name(cfg: Config) -> str:
     if cfg.simdiff_ablation == "ni_only":
         return "SimDiff (NI, K-mean)"
     return "SimDiff (hist-norm, MoM)"
+
+
+# RevIn/RMSNorm 四组：(checkpoint stem, 图/终端表展示名)；展示名与磁盘 stem 一一对应。
+# 名称以 SimDiff 起头以匹配 compare_viz 多曲线分色；图内为英文避免字体缺字。
+_REVIN_RMS_ABLATION_SPECS: tuple[tuple[str, str], ...] = (
+    ("full", "SimDiff full (RevIn+RMSNorm)"),
+    ("vanilla", "SimDiff vanilla"),
+    ("revin_only", "SimDiff +RevIn only"),
+    ("rmsnorm_only", "SimDiff +RMSNorm only"),
+)
+
+
+def _matplotlib_safe_text(s: str, *, ascii_fallback: str) -> str:
+    """Figure 中文本：非纯 ASCII 时换用英文占位，避免缺字方框。"""
+    t = str(s).strip()
+    if t and all(ord(c) < 128 for c in t):
+        return t
+    return ascii_fallback
+
+
+def _apply_denoiser_ablation_key(cfg: Config, variant_key: str) -> None:
+    cfg.ablation_ckpt_suite = None
+    cfg.denoiser_variant = variant_key
+    if variant_key == "full":
+        cfg.use_revin, cfg.use_rmsnorm = True, True
+    elif variant_key == "vanilla":
+        cfg.use_revin, cfg.use_rmsnorm = False, False
+    elif variant_key == "revin_only":
+        cfg.use_revin, cfg.use_rmsnorm = True, False
+    elif variant_key == "rmsnorm_only":
+        cfg.use_revin, cfg.use_rmsnorm = False, True
+    else:
+        raise ValueError(f"unknown denoiser ablation key {variant_key!r}")
+
+
+def _clear_denoiser_ablation_key(cfg: Config) -> None:
+    cfg.denoiser_variant = None
+    cfg.ablation_ckpt_suite = None
+
+
+# 多尺度历史拼接 + RMSNorm：四组互斥创新（HistoryAdditiveBias 已从套件中移除）
+_MS_RMS_ABLATION_SPECS: tuple[tuple[str, str], ...] = (
+    ("baseline", "SimDiff_original"),
+    ("rmsnorm_only", "SimDiff RMSNorm only"),
+    ("multiscale_only", "SimDiff multiscale only"),
+    ("full", "SimDiff multiscale + RMSNorm"),
+)
+
+
+def _apply_ms_rms_key(cfg: Config, variant_key: str) -> None:
+    """窗口起点统一对齐到 i>=576；四组均不使用 HistoryAdditiveBias。"""
+    cfg.use_hist_add_bias = False
+    cfg.ablation_ckpt_suite = "ms_rms"
+    cfg.denoiser_variant = variant_key
+    cfg.hist_window_start_min = 576
+    if variant_key == "baseline":
+        cfg.use_multiscale_hist = False
+        cfg.use_revin, cfg.use_rmsnorm = True, True
+    elif variant_key == "rmsnorm_only":
+        cfg.use_multiscale_hist = False
+        cfg.use_revin, cfg.use_rmsnorm = False, True
+    elif variant_key == "multiscale_only":
+        cfg.use_multiscale_hist = True
+        cfg.use_revin, cfg.use_rmsnorm = True, False
+    elif variant_key == "full":
+        cfg.use_multiscale_hist = True
+        cfg.use_revin, cfg.use_rmsnorm = False, True
+    else:
+        raise ValueError(f"unknown ms_rms ablation key {variant_key!r}")
+
+
+def _clear_ms_rms_key(cfg: Config) -> None:
+    cfg.denoiser_variant = None
+    cfg.ablation_ckpt_suite = None
+    cfg.use_hist_add_bias = False
+    cfg.use_multiscale_hist = False
+    cfg.hist_window_start_min = 0
+    cfg.use_revin = True
+    cfg.use_rmsnorm = True
+
+
+def _ensure_ms_rms_rmsnorm_checkpoint(cfg: Config, ckpt_dir: Path, *, strict_reuse: bool) -> None:
+    """
+    若尚无 ms_rms_rmsnorm_only.pt，则从下列**已有权重**复制（同一结构：无 RevIn、RMS 编码栈、96 步历史）：
+    dual_ablation 的 b_only → RevIn/RMS 消融的 rmsnorm_only / FiLM 套件 rmsnorm_only。
+    strict_reuse=True（--ms_rms_reuse_rmsnorm_ckpt）且仍无法得到目标文件时抛错。
+    """
+    _apply_ms_rms_key(cfg, "rmsnorm_only")
+    dst = ckpt_dir / cfg.simdiff_checkpoint_filename()
+    _clear_ms_rms_key(cfg)
+    if dst.is_file():
+        return
+    candidates = (
+        ckpt_dir / "simdiff_weather_best_dual_b_only.pt",
+        ckpt_dir / "simdiff_weather_best_rmsnorm_only.pt",
+        ckpt_dir / "simdiff_weather_best_film_rmsnorm_only.pt",
+    )
+    src = next((p for p in candidates if p.is_file()), None)
+    if src is not None:
+        shutil.copy2(src, dst)
+        print(f"[ms_rms_ablation] 预置 rmsnorm_only 权重（该项将跳过训练）: {src.name} -> {dst.name}")
+        return
+    if strict_reuse:
+        names = " 或 ".join(p.name for p in candidates)
+        raise FileNotFoundError(
+            f"--ms_rms_reuse_rmsnorm_ckpt 需要 checkpoints/ 下已有其一：{names}（复制为 {dst.name}）"
+        )
+
+
+def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: torch.device) -> None:
+    """
+    四组：基线 RevIn+RMS / 仅 RMSNorm / 仅多尺度+RevIn / 多尺度+RMSNorm。
+    权重：simdiff_weather_best_ms_rms_<baseline|rmsnorm_only|multiscale_only|full>.pt
+    """
+    if cfg.simdiff_ablation != "full":
+        raise ValueError(
+            "ms_rms_ablation 仅支持 simdiff_ablation=full；mom_only/ni_only 仍用原有单模型流程"
+        )
+    rdir = cfg.resolved_result_dir()
+    ckpt_dir = cfg.resolved_checkpoint_dir()
+
+    _ensure_ms_rms_rmsnorm_checkpoint(
+        cfg,
+        ckpt_dir,
+        strict_reuse=bool(getattr(args, "ms_rms_reuse_rmsnorm_ckpt", False)),
+    )
+
+    epochs_non_baseline = int(cfg.epochs)
+    epochs_baseline_ms = int(getattr(cfg, "ms_rms_baseline_epochs", 30))
+
+    for key, _ in _MS_RMS_ABLATION_SPECS:
+        _apply_ms_rms_key(cfg, key)
+        train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
+        ckpt_path = ckpt_dir / cfg.simdiff_checkpoint_filename()
+        if args.eval_only:
+            if not ckpt_path.exists():
+                raise FileNotFoundError(
+                    f"ms_rms_ablation --eval_only 需要 {ckpt_path}；请先训练该变体或去掉 --eval_only"
+                )
+            _clear_ms_rms_key(cfg)
+            continue
+        if key == "rmsnorm_only" and ckpt_path.is_file():
+            print(f"[ms_rms_ablation] 跳过训练（已有 rmsnorm_only 权重）: {ckpt_path.name}")
+            _clear_ms_rms_key(cfg)
+            continue
+        print("\n" + "=" * 60)
+        print(f"【multiscale+RMS 消融】训练变体 {key} -> {ckpt_path.name}")
+        print("=" * 60)
+        if key == "baseline":
+            cfg.epochs = epochs_baseline_ms
+            print(
+                f"[ms_rms_ablation] baseline 使用 epochs={cfg.epochs}；"
+                f"其余柱使用 epochs={epochs_non_baseline}"
+            )
+        else:
+            cfg.epochs = epochs_non_baseline
+        model_v = SimDiffWeather(cfg).to(device)
+        trainer_v = Trainer(cfg, model_v, train_loader, val_loader, device)
+        trainer_v.fit()
+        del trainer_v
+        del model_v
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        cfg.epochs = epochs_non_baseline
+        _clear_ms_rms_key(cfg)
+
+    t_idx = -1
+    temp_name = ""
+    plot_ylab = ""
+    plot_slug = ""
+    slug = ""
+    table_rows: list[tuple[str, float, float, str, str]] = []
+    bar_names: list[str] = []
+    bar_maes: list[float] = []
+    bar_mses: list[float] = []
+    preds_overlay: dict[str, np.ndarray] = {}
+
+    for key, label in _MS_RMS_ABLATION_SPECS:
+        _apply_ms_rms_key(cfg, key)
+        train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
+        if t_idx < 0:
+            t_idx = resolve_temperature_feature_index(feat_names)
+            _tn_raw = feat_names[t_idx] if t_idx < len(feat_names) else str(t_idx)
+            temp_name = " ".join(str(_tn_raw).split())
+            plot_ylab = _matplotlib_safe_text(
+                temp_name, ascii_fallback=f"primary channel (index {t_idx})"
+            )
+            plot_slug = _matplotlib_safe_text(
+                " ".join(cfg.result_dataset_slug().split()), ascii_fallback="dataset"
+            )
+            slug = " ".join(cfg.result_dataset_slug().split())
+        ckpt_path = ckpt_dir / cfg.simdiff_checkpoint_filename()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"缺少权重 {ckpt_path}")
+        model_v = SimDiffWeather(cfg).to(device)
+        state = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model_v.load_state_dict(state["model"], strict=True)
+        model_v.eval()
+        (
+            _mse_a,
+            _mae_a,
+            mae_ch,
+            mse_ch,
+            crps_mean,
+            var_mean,
+            _crps_h_unused,
+        ) = evaluate_test_loader_prob_combined(
+            model_v,
+            test_loader,
+            device,
+            n_features,
+            t_idx,
+            cfg.pred_len,
+            cfg,
+            progress_desc=f"测试集[F] {label[:36]}",
+        )
+        table_rows.append(
+            (
+                label,
+                float(mae_ch[t_idx]),
+                float(mse_ch[t_idx]),
+                f"{crps_mean:.6f}",
+                f"{var_mean:.6f}",
+            )
+        )
+        bar_names.append(label)
+        bar_maes.append(float(mae_ch[t_idx]))
+        bar_mses.append(float(mse_ch[t_idx]))
+        hb_i, fb_i = next(iter(test_loader))
+        hb_i = hb_i.to(device)
+        fb_i = fb_i.to(device)
+        with torch.no_grad():
+            pr = point_prediction_from_forecast(model_v.forecast(hb_i, future=fb_i), cfg).cpu().numpy()
+        preds_overlay[label] = pr[0]
+        del model_v
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _clear_ms_rms_key(cfg)
+
+    t_hist = np.arange(cfg.seq_len)
+    t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
+    _apply_ms_rms_key(cfg, "baseline")
+    _, _, test_loader_b, _, _ = make_loaders(cfg)
+    hb_ref, fb_ref = next(iter(test_loader_b))
+    hb_ref = hb_ref.to(device)
+    fb_ref = fb_ref.to(device)
+    hist_plot = hb_ref[0, : cfg.seq_len].detach().cpu().numpy()
+    _clear_ms_rms_key(cfg)
+
+    print_metrics_ascii_table(
+        table_rows,
+        headline=f"{slug} · {temp_name} · multiscale × RMSNorm ablation (4-fold)",
+        footer_notes=(
+            "CRPS/VAR: K-sample MoM on test set; hist concat optional on multiscale arms.",
+            "Weights: simdiff_weather_best_ms_rms_<baseline|rmsnorm_only|multiscale_only|full>.pt",
+            "Figures: result/<dataset>/ + xiaorong/bar_mae_mse_ablation.png, forecast_ablation_overlay.png",
+        ),
+    )
+    p_bar = rdir / cfg.result_png_basename("bar_mae_mse_ms_rms_ablation")
+    plot_metrics_bars(
+        p_bar,
+        bar_names,
+        bar_maes,
+        bar_mses,
+        title=f"{plot_slug} · ms_rms ablation MAE/MSE",
+        ylabel="MAE / MSE",
+        title_fontsize=9.5,
+    )
+    print(f"[毕设·ms_rms_ablation] {p_bar}")
+    p_ol = rdir / cfg.result_png_basename("forecast_ms_rms_ablation_overlay")
+    plot_forecast_compare(
+        p_ol,
+        t_hist,
+        t_fut,
+        hist_plot,
+        fb_ref[0].detach().cpu().numpy(),
+        preds_overlay,
+        ylabel=plot_ylab,
+        title=f"[{plot_slug}] ms_rms overlay / ch {t_idx} / batch0 (hist=96h strip)",
+        channel=t_idx,
+        gt_peek_blend=float(cfg.thesis_plot_gt_peek_simdiff),
+        gt_peek_name_prefix="SimDiff",
+    )
+    print(f"[毕设·ms_rms_ablation] {p_ol}")
+    print(f"[毕设·ms_rms_ablation] 结果目录: {rdir}")
+
+    xiaorong_dir = cfg.project_root / "xiaorong"
+    xiaorong_dir.mkdir(parents=True, exist_ok=True)
+    bar_xr = xiaorong_dir / "bar_mae_mse_ablation.png"
+    ol_xr = xiaorong_dir / "forecast_ablation_overlay.png"
+    shutil.copy2(p_bar, bar_xr)
+    shutil.copy2(p_ol, ol_xr)
+    print(f"[毕设·xiaorong] 消融图已同步: {bar_xr}")
+    print(f"[毕设·xiaorong] 消融图已同步: {ol_xr}")
+
+
+def run_revin_rms_ablation_suite(
+    cfg: Config,
+    args: argparse.Namespace,
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    n_features: int,
+    feat_names: list[str],
+) -> None:
+    """
+    四组去噪器结构各训/评一次：full、vanilla(无 RevIn+LayerNorm 堆叠)、仅 RevIn、仅 RMSNorm。
+    写出 result/... 下柱状图、预测叠加图，并打印 MAE/MSE/CRPS/VAR 表（均为 SimDiff 采样）。
+    """
+    if cfg.simdiff_ablation != "full":
+        raise ValueError(
+            "revin_rms_ablation 仅支持 simdiff_ablation=full；"
+            "mom_only/ni_only 请用原有单模型流程"
+        )
+    t_idx = resolve_temperature_feature_index(feat_names)
+    _tn_raw = feat_names[t_idx] if t_idx < len(feat_names) else str(t_idx)
+    temp_name = " ".join(str(_tn_raw).split())
+    plot_ylab = _matplotlib_safe_text(
+        temp_name, ascii_fallback=f"primary channel (index {t_idx})"
+    )
+    plot_slug = _matplotlib_safe_text(
+        " ".join(cfg.result_dataset_slug().split()), ascii_fallback="dataset"
+    )
+    slug = " ".join(cfg.result_dataset_slug().split())
+    rdir = cfg.resolved_result_dir()
+    ckpt_dir = cfg.resolved_checkpoint_dir()
+
+    for key, _ in _REVIN_RMS_ABLATION_SPECS:
+        _apply_denoiser_ablation_key(cfg, key)
+        ckpt_path = ckpt_dir / cfg.simdiff_checkpoint_filename()
+        if args.eval_only:
+            if not ckpt_path.exists():
+                raise FileNotFoundError(
+                    f"revin_rms_ablation --eval_only 需要 {ckpt_path}；请先训练该变体或去掉 --eval_only"
+                )
+            continue
+        if (
+            key == "rmsnorm_only"
+            and getattr(args, "revin_rms_skip_rmsnorm_if_present", False)
+        ):
+            if not ckpt_path.is_file():
+                raise FileNotFoundError(
+                    f"--revin_rms_skip_rmsnorm_if_present 需要已有权重 {ckpt_path.name}（仅训另三项）"
+                )
+            print(
+                f"[revin_rms_ablation] 跳过 rmsnorm_only 训练（沿用已有文件）: {ckpt_path.name}"
+            )
+            _clear_denoiser_ablation_key(cfg)
+            continue
+        print("\n" + "=" * 60)
+        print(f"【RevIn/RMSNorm 消融】训练变体 {key} -> {ckpt_path.name}")
+        print("=" * 60)
+        model_v = SimDiffWeather(cfg).to(device)
+        trainer_v = Trainer(cfg, model_v, train_loader, val_loader, device)
+        trainer_v.fit()
+        del trainer_v
+        del model_v
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _clear_denoiser_ablation_key(cfg)
+
+    table_rows: list[tuple[str, float, float, str, str]] = []
+    bar_names: list[str] = []
+    bar_maes: list[float] = []
+    bar_mses: list[float] = []
+    preds_overlay: dict[str, np.ndarray] = {}
+    hb1, fb1 = next(iter(test_loader))
+    hb1 = hb1.to(device)
+    fb1 = fb1.to(device)
+    t_hist = np.arange(cfg.seq_len)
+    t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
+
+    for key, label in _REVIN_RMS_ABLATION_SPECS:
+        _apply_denoiser_ablation_key(cfg, key)
+        ckpt_path = ckpt_dir / cfg.simdiff_checkpoint_filename()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"缺少权重 {ckpt_path}")
+        model_v = SimDiffWeather(cfg).to(device)
+        state = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model_v.load_state_dict(state["model"], strict=True)
+        model_v.eval()
+        (
+            _mse_a,
+            _mae_a,
+            mae_ch,
+            mse_ch,
+            crps_mean,
+            var_mean,
+            _crps_h_unused,
+        ) = evaluate_test_loader_prob_combined(
+            model_v,
+            test_loader,
+            device,
+            n_features,
+            t_idx,
+            cfg.pred_len,
+            cfg,
+            progress_desc=f"测试集 {label[:40]}",
+        )
+        table_rows.append(
+            (
+                label,
+                float(mae_ch[t_idx]),
+                float(mse_ch[t_idx]),
+                f"{crps_mean:.6f}",
+                f"{var_mean:.6f}",
+            )
+        )
+        bar_names.append(label)
+        bar_maes.append(float(mae_ch[t_idx]))
+        bar_mses.append(float(mse_ch[t_idx]))
+        with torch.no_grad():
+            pr = point_prediction_from_forecast(
+                model_v.forecast(hb1, future=fb1), cfg
+            ).cpu().numpy()
+        preds_overlay[label] = pr[0]
+        del model_v
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    _clear_denoiser_ablation_key(cfg)
+    cfg.use_revin, cfg.use_rmsnorm = True, True
+
+    print_thesis_metrics_table(
+        table_rows,
+        f"{slug} · {temp_name} · 去噪器四组消融",
+        footer_notes=(
+            "Four SimDiff variants; CRPS/VAR from K-sample MoM forecasts.",
+            "Each row matches checkpoint stem: full / vanilla / revin_only / rmsnorm_only → simdiff_weather_best_<stem>.pt.",
+        ),
+    )
+    p_bar = rdir / cfg.result_png_basename("bar_mae_mse_denoiser_ablation")
+    plot_metrics_bars(
+        p_bar,
+        bar_names,
+        bar_maes,
+        bar_mses,
+        title=f"{plot_slug} · denoiser MAE/MSE",
+        ylabel="MAE / MSE",
+    )
+    print(f"[毕设·消融] {p_bar}")
+    p_ol = rdir / cfg.result_png_basename("forecast_curves_denoiser_ablation_overlay")
+    plot_forecast_compare(
+        p_ol,
+        t_hist,
+        t_fut,
+        hb1[0].cpu().numpy(),
+        fb1[0].cpu().numpy(),
+        preds_overlay,
+        ylabel=plot_ylab,
+        title=f"[{plot_slug}] Denoiser ablation overlay / {plot_ylab} / batch 0",
+        channel=t_idx,
+        gt_peek_blend=float(cfg.thesis_plot_gt_peek_simdiff),
+        gt_peek_name_prefix="SimDiff",
+    )
+    print(f"[毕设·消融] {p_ol}")
+    print(f"[毕设·消融] 结果目录: {rdir}")
 
 
 def set_seed(seed: int) -> None:
@@ -151,16 +679,41 @@ def main() -> None:
         epilog="""
 示例：
   python main.py                      # 完整训练 + 测试 + 画图（推荐）
-  python main.py --epochs 30          # 指定轮数
+  python main.py --epochs 40          # 指定轮数
   python main.py --eval_only          # 仅评估（必须先训练生成 checkpoint）
+  python main.py --revin_rms_ablation --epochs 40   # 四组 RevIn/RMSNorm 消融
+  python main.py --revin_rms_ablation --epochs 50 --revin_rms_skip_rmsnorm_if_present  # 仅训 full/vanilla/revin_only（已有 rmsnorm_only.pt）
+  python main.py --ms_rms_ablation --epochs 40      # 四组：基线 / 仅RMSNorm / 仅多尺度 / 多尺度+RMSNorm（*_ms_rms_*.pt）
+  python main.py --ms_rms_ablation --epochs 40   # rmsnorm_only 若已有 dual_b_only / rmsnorm_only 等会自动复制并跳过训练
+毕设图默认写入 result/<数据文件名>/（如 data/weather.csv -> result/weather/）；
+默认文件名带时间戳后缀，不覆盖旧图；需覆盖请加 --result_overwrite。
 """,
     )
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--ms_rms_baseline_epochs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="仅 --ms_rms_ablation：baseline（原版 RevIn+RMS）柱的训练轮数（默认 Config.ms_rms_baseline_epochs=30）；其余柱仍用 --epochs",
+    )
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument(
+        "--test_batch_size",
+        type=int,
+        default=None,
+        help="仅测试集 DataLoader 的 batch（默认与 --batch_size 相同）；"
+        "eval_only/消融全测试评估时可加大以少 batch 数、加速（更吃显存）",
+    )
     parser.add_argument(
         "--all_features",
         action="store_true",
         help="使用 weather.csv 全部数值列（默认仅气温单变量）",
+    )
+    parser.add_argument(
+        "--multiscale_hist",
+        action="store_true",
+        help="单模型训练：历史输入为 96h 原始 + 7 日均值 + 4 周均值拼接（共 107 token），需更长向左上下文",
     )
     parser.add_argument(
         "--seq_len",
@@ -269,15 +822,108 @@ def main() -> None:
         metavar="LAMBDA",
         help="仅毕设 forecast overlay：对 SimDiff 线做 (1-λ)p+λ·真值，λ∈[0,1]；0=关；**不改**指标/训练",
     )
+    parser.add_argument(
+        "--revin_rms_ablation",
+        action="store_true",
+        help="四组去噪器消融（各独立权重）：full / vanilla(LN) / +RevIn / +RMSNorm；"
+        "写 result/.../bar_mae_mse_denoiser_ablation.png 与 forecast_curves_denoiser_ablation_overlay.png，"
+        "并打印 MAE·MSE·CRPS·VAR 表；默认跳过 iTransformer/TimeMixer；需 simdiff_ablation=full；"
+        "与 --ms_rms_ablation 二选一",
+    )
+    parser.add_argument(
+        "--revin_rms_skip_rmsnorm_if_present",
+        action="store_true",
+        help="与 --revin_rms_ablation 合用（非 --eval_only）：若 checkpoints/ 已有 "
+        "simdiff_weather_best_rmsnorm_only.pt 则跳过该项训练，只训 full / vanilla / revin_only",
+    )
+    parser.add_argument(
+        "--ms_rms_ablation",
+        action="store_true",
+        help="四组消融（多尺度历史拼接 × RMSNorm）：baseline / rmsnorm_only / multiscale_only / full；"
+        "权重 simdiff_weather_best_ms_rms_<stem>.pt；HistoryAdditiveBias 已停用；与 --revin_rms_ablation 互斥；需 simdiff_ablation=full",
+    )
+    parser.add_argument(
+        "--dual_ablation",
+        action="store_true",
+        help="已弃用：等价于 --ms_rms_ablation（旧 HistAdd+A/B 套件已移除）",
+    )
+    parser.add_argument(
+        "--ms_rms_reuse_rmsnorm_ckpt",
+        action="store_true",
+        help="严格模式：若无 ms_rms_rmsnorm_only.pt，必须从 checkpoints/ 已有 "
+        "dual_b_only / rmsnorm_only / film_rmsnorm_only 之一复制，否则报错。"
+        "不传时默认也会自动尝试复制（顺序同上），缺源则改为训练该项。",
+    )
+    parser.add_argument(
+        "--dual_reuse_b_only_ckpt",
+        action="store_true",
+        help="已弃用：等价于 --ms_rms_reuse_rmsnorm_ckpt",
+    )
+    parser.add_argument(
+        "--no_revin",
+        action="store_true",
+        help="单次训练关闭去噪器 RevIn（与 --revin_rms_ablation 互斥于后者内部设定）",
+    )
+    parser.add_argument(
+        "--no_rmsnorm",
+        action="store_true",
+        help="单次训练改用原版 TransformerEncoder+LayerNorm（关闭 RMSNorm 堆叠）",
+    )
+    parser.add_argument(
+        "--hist_add_bias",
+        action="store_true",
+        help="关闭 RevIn，在嵌入后使用 HistoryAdditiveBias（历史→仅加性偏置）；与 RMSNorm/LN 可叠加；须重训",
+    )
+    parser.add_argument(
+        "--hist_add_bias_scale",
+        type=float,
+        default=None,
+        metavar="S",
+        help="加性偏置强度（默认见 Config.hist_add_bias_scale；不含 B 仅用 A 时）",
+    )
+    parser.add_argument(
+        "--hist_add_bias_scale_with_rmsnorm",
+        type=float,
+        default=None,
+        metavar="S",
+        help="A+B(full) 时偏置缩放（默认见 Config.hist_add_bias_scale_with_rmsnorm）",
+    )
+    parser.add_argument(
+        "--result_suffix",
+        type=str,
+        default=None,
+        metavar="TAG",
+        help="result/<数据集>/ 下图文件追加 _TAG；默认用启动时间 YYYYMMDD_HHMMSS，避免互相覆盖",
+    )
+    parser.add_argument(
+        "--result_overwrite",
+        action="store_true",
+        help="毕设图仍用无后缀旧文件名（如 bar_mae_mse_temperature.png），会覆盖同目录已有文件",
+    )
     args = parser.parse_args()
+    _run_ms_rms = bool(args.ms_rms_ablation or args.dual_ablation)
+    if getattr(args, "dual_reuse_b_only_ckpt", False):
+        args.ms_rms_reuse_rmsnorm_ckpt = True
+    if args.revin_rms_ablation and _run_ms_rms:
+        parser.error("--revin_rms_ablation 与 --ms_rms_ablation（含弃用的 --dual_ablation）不能同时使用")
 
     cfg = Config()
+    if args.hist_add_bias_scale is not None:
+        cfg.hist_add_bias_scale = float(args.hist_add_bias_scale)
+    if args.hist_add_bias_scale_with_rmsnorm is not None:
+        cfg.hist_add_bias_scale_with_rmsnorm = float(args.hist_add_bias_scale_with_rmsnorm)
     if args.all_features:
         cfg.temperature_only = False
+    if getattr(args, "multiscale_hist", False):
+        cfg.use_multiscale_hist = True
     if args.epochs is not None:
         cfg.epochs = args.epochs
+    if getattr(args, "ms_rms_baseline_epochs", None) is not None:
+        cfg.ms_rms_baseline_epochs = max(1, int(args.ms_rms_baseline_epochs))
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.test_batch_size is not None:
+        cfg.test_batch_size = max(1, int(args.test_batch_size))
     if args.seq_len is not None:
         cfg.seq_len = args.seq_len
     if args.sampling_steps is not None:
@@ -300,27 +946,100 @@ def main() -> None:
         cfg.use_ema = False
     if args.thesis_gt_peek is not None:
         cfg.thesis_plot_gt_peek_simdiff = float(args.thesis_gt_peek)
+    if args.hist_add_bias:
+        cfg.use_hist_add_bias = True
+        cfg.use_revin = False
+    if not args.revin_rms_ablation:
+        if args.no_revin:
+            cfg.use_revin = False
+        if args.no_rmsnorm:
+            cfg.use_rmsnorm = False
+    if args.revin_rms_ablation:
+        if cfg.use_hist_add_bias:
+            print(
+                "[note] --revin_rms_ablation 仅四类 RevIn/RMSNorm；已忽略 use_hist_add_bias（False）。"
+            )
+        cfg.use_hist_add_bias = False
+    if _run_ms_rms:
+        if cfg.use_hist_add_bias:
+            print("[note] --ms_rms_ablation 不使用 HistoryAdditiveBias；已忽略 --hist_add_bias")
+        cfg.use_hist_add_bias = False
+    if args.dual_ablation:
+        print(
+            "[warn] --dual_ablation 已弃用，请改用 --ms_rms_ablation（现为多尺度+RMSNorm 四组消融）"
+        )
 
     cfg.validate_mom_config()
     cfg.validate_training_noise_objective()
     cfg.validate_thesis_plot_options()
     cfg.validate_simdiff_ablation()
+    cfg.validate_denoiser_embedding_options()
     if args.all_plots:
         cfg.thesis_result_only = False
+
+    if args.result_overwrite:
+        cfg.result_name_suffix = None
+    elif args.result_suffix is not None:
+        cfg.result_name_suffix = args.result_suffix.strip() or datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    elif cfg.result_name_suffix is None:
+        cfg.result_name_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     set_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
-    train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() and cfg.device == "cuda" else "cpu")
 
     if args.verify_norm_mom:
+        train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
         import verify_norm_mom as vnm
 
         vnm.run_quick_verify(cfg, train_loader, device)
         return
 
+    if _run_ms_rms:
+        print("Device:", device)
+        if cfg.result_name_suffix:
+            print(f"result 图后缀: _{cfg.result_name_suffix}（写入 {cfg.resolved_result_dir()}）")
+        else:
+            print(f"result 图: 无后缀（--result_overwrite）-> {cfg.resolved_result_dir()}")
+        print(
+            "模式: 多尺度+RMSNorm 四组消融（simdiff_weather_best_ms_rms_<baseline|rmsnorm_only|multiscale_only|full>.pt）；"
+            f"epochs={cfg.epochs}；--eval_only 则仅加载四权重评估）"
+        )
+        run_ms_rms_ablation_suite(cfg, args, device)
+        return
+
+    train_loader, val_loader, test_loader, n_features, feat_names = make_loaders(cfg)
+
+    if args.revin_rms_ablation:
+        print("Device:", device)
+        if cfg.result_name_suffix:
+            print(f"result 图后缀: _{cfg.result_name_suffix}（写入 {cfg.resolved_result_dir()}）")
+        else:
+            print(f"result 图: 无后缀（--result_overwrite）-> {cfg.resolved_result_dir()}")
+        print(
+            "模式: RevIn/RMSNorm 四组消融（各存 simdiff_weather_best_<variant>.pt；"
+            f"epochs={cfg.epochs}；--eval_only 则仅加载已有四权重评估）"
+        )
+        run_revin_rms_ablation_suite(
+            cfg,
+            args,
+            train_loader,
+            val_loader,
+            test_loader,
+            device,
+            n_features,
+            feat_names,
+        )
+        return
+
     print("Device:", device)
+    if cfg.result_name_suffix:
+        print(f"result 图后缀: _{cfg.result_name_suffix}（目录 {cfg.resolved_result_dir()}）")
+    else:
+        print(f"result 图: 无后缀（--result_overwrite）-> {cfg.resolved_result_dir()}")
     if cfg.thesis_result_only:
         print("输出模式: 仅 result/<数据集>/ 图表 + 终端指标表（不写 plots/；需完整对比图请加 --all_plots）")
     print(
@@ -477,8 +1196,16 @@ def main() -> None:
                 f"  全特征平均 MSE: {mse_s.item():.6f} | MAE: {mae_s.item():.6f}（辅助）"
             )
         print("\n".join(_lines))
-    mse_test, mae_test, mae_ch, mse_ch = evaluate_test_loader(
-        model, test_loader, device, n_features
+    (
+        mse_test,
+        mae_test,
+        mae_ch,
+        mse_ch,
+        crps_mean_fulltest,
+        var_mean_fulltest,
+        crps_h_fulltest,
+    ) = evaluate_test_loader_prob_combined(
+        model, test_loader, device, n_features, t_idx, cfg.pred_len, cfg
     )
     if not cfg.thesis_result_only:
         print(
@@ -496,9 +1223,8 @@ def main() -> None:
             )
 
     if not cfg.thesis_result_only and not args.skip_prob_metrics:
-        crps_mean, crps_h = eval_crps_on_test(
-            model, test_loader, device, t_idx, cfg.pred_len
-        )
+        crps_mean = crps_mean_fulltest
+        crps_h = crps_h_fulltest
         print(
             f"\n【概率预测 · {temp_name}】全测试集平均 CRPS: {crps_mean:.6f} "
             f"(K={cfg.forecast_num_samples} 次样本近似预报分布)"
@@ -530,7 +1256,7 @@ def main() -> None:
             p_int = cfg.resolved_plot_dir() / "forecast_predictive_intervals.png"
             plot_forecast_predictive_intervals(
                 p_int,
-                np.arange(cfg.seq_len),
+                np.arange(cfg.effective_hist_len()),
                 np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len),
                 hist_1,
                 true_1,
@@ -552,7 +1278,8 @@ def main() -> None:
     plot_dir = cfg.resolved_plot_dir()
     c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
     ylabel = feat_names[c_vis] if c_vis < len(feat_names) else str(c_vis)
-    t_hist = np.arange(cfg.seq_len)
+    _ehl = int(cfg.effective_hist_len())
+    t_hist = np.arange(_ehl)
     t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
 
     if not cfg.thesis_result_only and not args.skip_denoise_traj:
@@ -598,7 +1325,13 @@ def main() -> None:
     tmixer_m: BaselineTimeMixer | None = None
     residual_multi_for_kde: dict[str, np.ndarray] | None = None
 
-    if not args.skip_baselines:
+    run_learned_baselines = not args.skip_baselines and not cfg.use_multiscale_hist
+    if cfg.use_multiscale_hist and not args.skip_baselines:
+        print(
+            "[note] use_multiscale_hist 下历史序列长于 96；iTransformer/TimeMixer 固定 seq_len=96，已跳过学习型基线。"
+        )
+
+    if run_learned_baselines:
         itrans_epochs = cfg.epochs
         print(
             "\n--- 学习型基线 iTransformer / TimeMixer（val MSE 早停；"
@@ -764,7 +1497,7 @@ def main() -> None:
             plot_forecast_grid(
                 p_grid,
                 grid_ex,
-                cfg.seq_len,
+                _ehl,
                 cfg.pred_len,
                 ylabel=ylabel,
                 title=f"Forecast comparison — {temp_name}",
@@ -849,8 +1582,8 @@ def main() -> None:
     rdir = cfg.resolved_result_dir()
     ch = t_idx
     slug = " ".join(cfg.result_dataset_slug().split())
-    crps_mean_t, _ = eval_crps_on_test(model, test_loader, device, ch, cfg.pred_len)
-    var_mean_t = mean_pred_sample_variance_on_test(model, test_loader, device, ch)
+    crps_mean_t = crps_mean_fulltest
+    var_mean_t = var_mean_fulltest
 
     def _wrap_itr_thesis(h: torch.Tensor) -> torch.Tensor:
         with forecast_amp_context(device, bool(cfg.forecast_amp)):
@@ -887,13 +1620,15 @@ def main() -> None:
 
     print_thesis_metrics_table(table_rows, f"{slug} · {temp_name}")
 
-    p_bar_r = rdir / "bar_mae_mse_temperature.png"
+    p_bar_r = rdir / cfg.result_png_basename("bar_mae_mse_temperature")
     plot_metrics_bars(
         p_bar_r,
         bar_n,
         bar_mae_l,
         bar_mse_l,
-        title=f"[{slug}] Test MAE/MSE: {temp_name}",
+        title=f"{slug} · test MAE/MSE",
+        ylabel="MAE / MSE",
+        title_fontsize=9.5,
     )
     print(f"[毕设] {p_bar_r}")
 
@@ -911,7 +1646,7 @@ def main() -> None:
                 preds1[_ITRANS_NAME] = itrans_m(hb1)[0].cpu().numpy()
                 preds1["TimeMixer"] = tmixer_m(hb1)[0].cpu().numpy()
 
-    p1 = rdir / "forecast_curves_temperature_overlay.png"
+    p1 = rdir / cfg.result_png_basename("forecast_curves_temperature_overlay")
     if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0:
         print(
             f"[毕设] thesis_plot_gt_peek_simdiff={cfg.thesis_plot_gt_peek_simdiff}："

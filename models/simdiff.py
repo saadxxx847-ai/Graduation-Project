@@ -41,12 +41,16 @@ class SimDiffWeather(nn.Module):
             raise ValueError("请先加载数据并设置 cfg.input_dim")
         cfg.validate_mom_config()
         cfg.validate_simdiff_ablation()
+        cfg.validate_denoiser_embedding_options()
         if cfg.train_future_marginal_mean is None or cfg.train_future_marginal_std is None:
             raise ValueError("请先运行 make_loaders 以写入 train_future_marginal_mean/std")
 
         self.cfg = cfg
+        _abd = float(getattr(cfg, "hist_add_bias_scale", 0.12))
+        if bool(getattr(cfg, "use_hist_add_bias", False)) and bool(cfg.use_rmsnorm):
+            _abd = float(getattr(cfg, "hist_add_bias_scale_with_rmsnorm", 0.08))
         self.net = DenoiserTransformer(
-            cfg.seq_len,
+            cfg.effective_hist_len(),
             cfg.pred_len,
             cfg.input_dim,
             cfg.d_model,
@@ -55,6 +59,8 @@ class SimDiffWeather(nn.Module):
             cfg.dropout,
             use_revin=bool(cfg.use_revin),
             use_rmsnorm=bool(cfg.use_rmsnorm),
+            use_hist_add_bias=bool(getattr(cfg, "use_hist_add_bias", False)),
+            hist_add_bias_scale=_abd,
         )
         self.diffusion = GaussianDiffusion(cfg.timesteps, cfg.cosine_s)
         self._sample_clamp_abs = float(cfg.z_clip) + 2.0
@@ -87,7 +93,7 @@ class SimDiffWeather(nn.Module):
     def training_loss(self, hist: torch.Tensor, future: torch.Tensor) -> torch.Tensor:
         if self.cfg.debug_norm_assert:
             IndependentNormalizer.debug_assert_shapes_and_idempotent_history(
-                hist, future, self.cfg.seq_len, self.cfg.pred_len
+                hist, future, self.cfg.effective_hist_len(), self.cfg.pred_len
             )
         hist_n, st_h = IndependentNormalizer.normalize_history(hist)
         hist_n = self._clip_z(hist_n)
