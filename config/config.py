@@ -85,7 +85,7 @@ class Config:
     # 仅 test DataLoader 的 batch；None 时与 batch_size 相同。--eval_only 等仅跑测试时可设大以少迭代、加速
     test_batch_size: int | None = None
     # 略低于 3e-4：配合 RevIn 实例归一与更深网络，减少前期震荡
-    learning_rate: float = 2e-4
+    learning_rate: float = 3e-4
     # 若 MAE 仍高于基线：可试更长训练、或微调 lr（须删 ckpt 重训）
     epochs: int = 50
     # --ms_rms_ablation 时仅 baseline（原版 RevIn+RMS）使用的 epoch；其余三柱仍用 epochs

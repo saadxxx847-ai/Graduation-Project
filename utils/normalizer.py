@@ -15,12 +15,15 @@ class Normalizer:
         future,
         independent_future: bool = True,
         eps: float = 1e-5,
+        hist_stats_span: int | None = None,
     ):
         if not independent_future:
             raise ValueError(
                 "已统一为 SimDiff NI：请使用 IndependentNormalizer.normalize_history / normalize_future"
             )
-        hist_n, sh = IndependentNormalizer.normalize_history(hist, eps=eps)
+        hist_n, sh = IndependentNormalizer.normalize_history(
+            hist, eps=eps, hist_stats_span=hist_stats_span
+        )
         fut_n, sf = IndependentNormalizer.normalize_future(future, eps=eps)
         stats = {**sh, **sf}
         return hist_n, fut_n, stats

@@ -1,7 +1,7 @@
 """
 Normalization Independence（SimDiff）：历史段与未来段各自仅用本段数据估计统计量，互不混用。
 
-* normalize_history：μ_h, σ_h 仅由 hist 在时间维上计算，**不得**依赖 future。
+* normalize_history：μ_h, σ_h 仅由 **hist 的指定时间跨度** 计算（默认整段 Lh；多尺度时应为前 seq_len 步细粒度段），**不得**依赖 future。多尺度拼接中若用整段 Lh 算统计量，日/周池化段会污染 μ/σ，反变换与未来归一化虽独立，但条件分布会错。
 * normalize_future：μ_f, σ_f 仅由 future 在时间维上计算，**不得**依赖 hist。
 * 推理阶段若无真值 future，反归一化使用训练集上仅由「未来窗口」聚合得到的边际 μ,σ（见 data_loader.fit_future_marginal_stats）。
 """
@@ -14,14 +14,31 @@ class IndependentNormalizer:
     """窗口级独立归一化：历史与未来统计量严格分离。"""
 
     @staticmethod
-    def normalize_history(hist: torch.Tensor, eps: float = 1e-5) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def normalize_history(
+        hist: torch.Tensor,
+        eps: float = 1e-5,
+        *,
+        hist_stats_span: int | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        hist: (B, Lh, C)。仅使用 hist 计算 μ_h, σ_h。
+        hist: (B, Lh, C)。μ_h, σ_h 仅由 hist[:, :span] 计算，再对**整段** hist 做仿射（span 默认 Lh，与旧行为一致）。
+
+        多尺度历史 Lh = seq_len + 11 时，应传 hist_stats_span=seq_len，仅用细粒度小时段估计统计量，
+        避免日/周均值段进入 mean/std。
         """
         if hist.ndim != 3:
             raise ValueError(f"hist 期望 (B,Lh,C)，得到 {tuple(hist.shape)}")
-        mu_h = hist.mean(dim=1, keepdim=True)
-        sig_h = hist.std(dim=1, keepdim=True).clamp_min(eps)
+        lh = int(hist.shape[1])
+        if hist_stats_span is None:
+            span = lh
+        else:
+            span = int(hist_stats_span)
+            if span <= 0:
+                raise ValueError(f"hist_stats_span 须为正，得到 {span}")
+            span = min(span, lh)
+        ref = hist[:, :span, :]
+        mu_h = ref.mean(dim=1, keepdim=True)
+        sig_h = ref.std(dim=1, keepdim=True).clamp_min(eps)
         hist_n = (hist - mu_h) / sig_h
         stats = {"mu_h": mu_h, "sig_h": sig_h}
         return hist_n, stats

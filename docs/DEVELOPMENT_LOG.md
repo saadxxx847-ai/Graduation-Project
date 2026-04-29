@@ -990,3 +990,83 @@ python main.py --data_path data/ETTh1.csv --figures_dir ETTh1 \
 - **含义**：两条基线在信息上 **弱于** 全量多尺度 SimDiff（公平性说明写进 `[note]` 终端提示）；若希望基线也得到「整段上下文」量级，需在架构上重做基线或使用 **`--single_scale_hist`** 做「人人 96 步」的另一套对照。
 
 ---
+
+## 2026-04-29：多尺度历史 NI — `hist_stats_span`（仅用前 `seq_len` 步估 μ_h, σ_h）
+
+### 现象与根因
+
+- 多尺度下 `hist` 为 `[seq_len 细粒度 | 7 日均价 | 4 周均价]`（Lh = seq_len+11）。此前 `normalize_history` 在 **整段 Lh** 上算 mean/std，池化段的尺度与分布与小时段不同，**污染** μ_h、σ_h，使条件化输入与训练目标空间错位；表现为多条模型曲线相对真值 **整体平移**、趋势拟合差等（与仅关多尺度后误差减小的现象一致）。
+- **不是** `inverse_transform_future` 公式错误：实现为 \(Y = z\sigma_f + \mu_f\)，与 `normalize_future` 可逆。
+
+### 改动
+
+| 文件 | 说明 |
+|------|------|
+| `utils/independent_normalizer.py` | `normalize_history(..., hist_stats_span=None)`：默认仍用整段 Lh（兼容旧调用）；若传 `hist_stats_span=seq_len`，则 μ_h、σ_h 仅来自 `hist[:, :seq_len]`，再对 **全长** hist 做仿射。 |
+| `models/simdiff.py` | `training_loss` / `forecast` / `get_denoise_trajectory_physical` 均传入 `hist_stats_span=int(cfg.seq_len)`。 |
+| `verify_norm_mom.py` | 与主流程一致，对 batch 使用 `hist_stats_span=cfg.seq_len`。 |
+| `utils/normalizer.py` | `normalize_pair` 增加可选 `hist_stats_span` 并下传。 |
+
+### 权重兼容
+
+- **多尺度 SimDiff 既有 checkpoint** 在旧统计量分布上训练，与本 fix 后的输入分布不一致，需 **重新训练** 后再报告指标与曲线。
+
+---
+
+## 2026-04-29：`Config.learning_rate` 默认 `2e-4` → `3e-4`
+
+- **`config/config.py`**：`learning_rate` 默认值改为 **`3e-4`**（与此前文档中「主训练默认 lr」表述对齐；无 CLI 覆盖时生效）。
+
+---
+
+## 2026-04-29：Ground truth / overlay 核查与绘图修正（非 NI 训练语义错误）
+
+### 关于「未来用自身 μ/σ、推理用历史 μ/σ」类说法
+
+- **与本仓库不符**：SimDiff 在 `forecast(..., future=fut)` 下用 **`normalize_future(future)`** 的 μ_f、σ_f 做反变换（见 `models/simdiff.py` `_future_mu_sig_for_inverse`）；训练目标也在 **未来窗口独立** z-score 空间，与有真值评估时一致。iTransformer / TimeMixer 在 **原始尺度** 上拟合，不存在同一类 denorm 混用。
+- **数据加载** `WeatherWindowDataset.__getitem__` 返回的 `fut` 与 `hist` 在时间上连续：`fut = data[i+seq_len : i+seq_len+pred_len]`，**ground truth 未画错**。
+
+### 实际 bug（多尺度 + 纯可视化 / 辅助图）
+
+1. **Overlay 边界锚定与 GT 连线**：`hist[-1]` 在多尺度下是 **周池化尾点**，不是「预报起点前一小时」；`anchor_forecast_boundary` 与 history→GT 连线若用 `-1`，会与不同时刻的真值首步错位。**修复**：`plot_forecast_compare*` 增加 **`hist_anchor_index`**；`main.thesis_overlay_hist_anchor_index(cfg)` 在多尺度时取 **`seq_len-1`**。
+2. **`plot_forecast_predictive_intervals`**：`t_fut` 曾误用 **`seq_len` 起点**，与 `t_hist=0..ehl-1` 在 x 轴上 **重叠 11 步**。**修复**：`t_fut = arange(ehl, ehl+pred_len)`。
+3. **`plot_forecast_grid`**：曾固定 `seq_len` 为横轴长度，与 `Lh>seq_len` 的 multiscale **不匹配**；主流程误传 **`_ehl`（未定义）**。**修复**：按每条样本 `h.shape[0]` 生成 `t_hist/t_fut`，签名改为 **`(examples, pred_len, ...)`**。
+
+### 涉及文件
+
+| 文件 | 说明 |
+|------|------|
+| `utils/compare_viz.py` | `hist_anchor_index`；`plot_forecast_grid` 按 Lh 定轴 |
+| `main.py` | `thesis_overlay_hist_anchor_index`；毕设 overlay / 预测区间 / grid 调用 |
+
+---
+
+## 2026-04-29：彻底杜绝 overlay 上 ground truth 画进 history x 区间
+
+### 根因
+
+- 多尺度时 ``Lh = effective_hist_len() > seq_len``。若调用方仍传入 ``t_fut = seq_len .. seq_len+Lf-1``，而 ``t_hist = 0 .. Lh-1``，则 **GT 与 history 在 x∈[seq_len, Lh-1] 上重叠**，表现为「真值折线跑回 history 时段」。此错误曾由 **main 与 ``plot_forecast_compare`` 的拆参组合** 反复引入。
+- **治本**：在 **`plot_forecast_compare`**、**`plot_forecast_predictive_intervals`**、**`plot_forecast_compare_two_panels`** 内部，**仅根据** ``hist.shape[0]`` 与 ``true_fut.shape[0]`` 生成 ``t_hist`` / ``t_fut``，**不再**接受外部传入的时间轴；并对 ``preds`` 与 ``Lf`` 做一致性检查。
+- **`main.py`**：移除仅服务于上表除「手写 forecast_example」外对 ``forecast_overlay_time_axes`` 的依赖；**`forecast_example.png`** 亦改为按 ``hist0/true0`` 长度本地生成横轴。
+- **`forecast_overlay_time_axes(cfg)`** 仍保留，供文档/外部脚本与手工对齐语义（与现绘图推导一致：``t_fut[0]=Lh``）。
+
+---
+
+## 2026-04-29：overlay「真值画到虚线前」实为边界 **连接线** 误导
+
+### 现象
+
+- 多尺度下 `hist_anchor_index=seq_len-1` 时，曾在 **细粒度末步** 与未来首点之间画 **粗黑实线**，与 **ground truth** 线同色同宽；该线段横跨 x=seq_len..Lh-1（池化段），**几乎全部落在竖虚线（Lh-0.5）左侧**，易被误认为「GT 进 history」。
+- **真实** GT 折线仅绘制在 `t_fut = Lh ..`；无需因本项重训权重。
+
+### 修复
+
+- `plot_forecast_compare` / `plot_forecast_compare_two_panels`：边界连接改为 **仅** `(Lh-1, hist[-1]) → (Lh, true_fut[0])`；样式改为 **灰虚线、较细**，与黑色实线 GT 区分。
+
+---
+
+## 2026-04-29：预报起点装饰（底色/圆点）已撤回
+
+- **曾**在 overlay 上加 ``[Lh-1,Lh]`` 浅底色与末/首点 scatter；用户反馈后 **已恢复**为仅 **``ax.axvline(..., gray : )``** 的简单分界（与此前习惯一致）。
+
+---

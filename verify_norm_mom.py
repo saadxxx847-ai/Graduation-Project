@@ -32,9 +32,13 @@ def run_quick_verify(
     fut = fut.to(device)
 
     # --- NI：normalize_history 不读 future ---
-    _, sh1 = IndependentNormalizer.normalize_history(hist)
+    _, sh1 = IndependentNormalizer.normalize_history(
+        hist, hist_stats_span=int(cfg.seq_len)
+    )
     _ = torch.roll(fut, shifts=3, dims=0)
-    _, sh2 = IndependentNormalizer.normalize_history(hist)
+    _, sh2 = IndependentNormalizer.normalize_history(
+        hist, hist_stats_span=int(cfg.seq_len)
+    )
     assert torch.allclose(sh1["mu_h"], sh2["mu_h"]), "历史 μ 不应随 future 改变（NI）"
     assert torch.allclose(sh1["sig_h"], sh2["sig_h"]), "历史 σ 不应随 future 改变（NI）"
     fn, sf = IndependentNormalizer.normalize_future(fut)

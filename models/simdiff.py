@@ -1,7 +1,7 @@
 """
 SimDiff-Weather：Normalization Independence + Median-of-Means 集成预测。
 
-* 历史与未来分别在各自时间维上估计 μ,σ，互不混用；网络条件为 normalize_history(hist)。
+* 历史与未来分别在各自时间维上估计 μ,σ，互不混用；网络条件为 normalize_history(hist, hist_stats_span=seq_len)（多尺度时仅用前 seq_len 步估计 μ_h,σ_h）。
 * 扩散目标在 normalize_future(future) 空间；评估时有真值则用 batch 的 μ_f,σ_f 反变换，无真值则用训练集未来边际统计量。
 """
 from __future__ import annotations
@@ -95,7 +95,9 @@ class SimDiffWeather(nn.Module):
             IndependentNormalizer.debug_assert_shapes_and_idempotent_history(
                 hist, future, self.cfg.effective_hist_len(), self.cfg.pred_len
             )
-        hist_n, st_h = IndependentNormalizer.normalize_history(hist)
+        hist_n, st_h = IndependentNormalizer.normalize_history(
+            hist, hist_stats_span=int(self.cfg.seq_len)
+        )
         hist_n = self._clip_z(hist_n)
         if self.cfg.simdiff_ablation == "mom_only":
             mu_h, sig_h = st_h["mu_h"], st_h["sig_h"]
@@ -160,7 +162,9 @@ class SimDiffWeather(nn.Module):
         mp = int(max_points if max_points is not None else self.cfg.denoise_trajectory_max_points)
         device = hist.device
         b0 = hist[:1]
-        hist_n, st_h = IndependentNormalizer.normalize_history(b0)
+        hist_n, st_h = IndependentNormalizer.normalize_history(
+            b0, hist_stats_span=int(self.cfg.seq_len)
+        )
         hist_n = self._clip_z(hist_n)
         _out = self.diffusion.sample(
             self.net,
@@ -214,7 +218,9 @@ class SimDiffWeather(nn.Module):
         elif k % m != 0:
             raise ValueError(f"K={k} 必须能被 M={m} 整除")
 
-        hist_n, st_h = IndependentNormalizer.normalize_history(hist)
+        hist_n, st_h = IndependentNormalizer.normalize_history(
+            hist, hist_stats_span=int(self.cfg.seq_len)
+        )
         hist_n = self._clip_z(hist_n)
 
         stacked = self._sample_k_trajectories_norm(hist_n, k)

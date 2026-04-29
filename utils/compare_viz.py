@@ -95,21 +95,37 @@ def _apply_gt_peek_blend_for_display(
     return out
 
 
+def _resolve_hist_anchor_index(hist: np.ndarray, hist_anchor_index: int) -> int:
+    """hist_anchor_index：>=0 为绝对下标；-1 表示最后一格。"""
+    lh = int(hist.shape[0])
+    if lh <= 0:
+        return 0
+    if hist_anchor_index < 0:
+        ai = lh + hist_anchor_index
+    else:
+        ai = int(hist_anchor_index)
+    return int(min(max(ai, 0), lh - 1))
+
+
 def _anchor_preds_to_hist_end(
     hist: np.ndarray,
     preds: dict[str, np.ndarray],
     channel: int,
     enabled: bool,
+    hist_anchor_index: int = -1,
 ) -> dict[str, np.ndarray]:
     """
-    仅用于绘图：将各模型预测在通道 channel 上整体平移，使首步与 hist[-1,c] 对齐，
+    仅用于绘图：将各模型预测在通道 channel 上整体平移，使首步与 hist[i,c] 对齐（默认 i=-1 即末格），
     减轻边界处「陡升/陡降」观感；不改变磁盘上的数值评估（main 中指标仍用原始 pred）。
+
+    多尺度 history 末格为周池化统计量时，应传 hist_anchor_index=seq_len-1，与真值未来首步在时间上衔接。
     """
     if not enabled:
         return preds
     c = int(channel)
+    ai = _resolve_hist_anchor_index(hist, hist_anchor_index)
     out: dict[str, np.ndarray] = {}
-    h_last = float(hist[-1, c])
+    h_last = float(hist[ai, c])
     for name, p in preds.items():
         arr = np.asarray(p, dtype=np.float64).copy()
         if arr.ndim == 1:
@@ -258,8 +274,6 @@ def plot_horizon_mae(
 
 def plot_forecast_compare(
     path: Path,
-    t_hist: np.ndarray,
-    t_fut: np.ndarray,
     hist: np.ndarray,
     true_fut: np.ndarray,
     preds: dict[str, np.ndarray],
@@ -268,13 +282,16 @@ def plot_forecast_compare(
     channel: int = 0,
     y_zoom_forecast: bool = True,
     anchor_forecast_boundary: bool = True,
+    hist_anchor_index: int = -1,
     gt_peek_blend: float = 0.0,
     gt_peek_name_prefix: str = "SimDiff",
 ) -> None:
     """
     单窗口：历史 + 真值未来 + 多模型预测。
-    **横轴**：`hist` 行数须等于 `len(t_hist)`；未来段须紧接历史，`t_fut[0]` 应为 `len(t_hist)`（即 conditioning 长度），
-    不得误用 `seq_len` 当未来起点（多尺度 history 长于 seq_len 时否则会与 history 在 x 轴重叠并出现折返）。
+
+    **横轴**：始终由 ``hist.shape[0]`` 与 ``true_fut.shape[0]`` 推导：
+    ``t_hist = 0..Lh-1``，``t_fut = Lh .. Lh+Lf-1``，避免调用方误传 ``seq_len`` 起点导致
+    ground truth 与多尺度 history 在 x 轴上重叠（旧 bug）。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     c = int(channel)
@@ -282,7 +299,19 @@ def plot_forecast_compare(
         hist = hist.reshape(-1, 1)
     if true_fut.ndim == 1:
         true_fut = true_fut.reshape(-1, 1)
-    preds_draw = _anchor_preds_to_hist_end(hist, preds, c, anchor_forecast_boundary)
+    lh = int(hist.shape[0])
+    lf = int(true_fut.shape[0])
+    t_hist = np.arange(lh)
+    t_fut = np.arange(lh, lh + lf)
+    for _n, _p in preds.items():
+        _a = np.asarray(_p)
+        if _a.shape[0] != lf:
+            raise ValueError(
+                f"plot_forecast_compare: 预测 {_n!r} 的时间长度 {_a.shape[0]} 与 true_fut {lf} 不一致"
+            )
+    preds_draw = _anchor_preds_to_hist_end(
+        hist, preds, c, anchor_forecast_boundary, hist_anchor_index
+    )
     if float(gt_peek_blend) > 0.0:
         preds_draw = _apply_gt_peek_blend_for_display(
             preds_draw,
@@ -300,16 +329,17 @@ def plot_forecast_compare(
         linewidth=2.0,
         zorder=4,
     )
-    # 连接 history 末点与真值首点，避免两段折线在边界处视觉「悬空」（y 轴仅用末段定标时更易出现）
+    # 仅连接 conditioning **最后一格** (Lh-1) 与未来首格 (Lh)，不再从细粒度末步拉长线跨过池化段，
+    # 否则粗黑斜线与 GT 同色同宽，在虚线左侧很长一段会被误认为「真值画进 history」。
     if t_hist.size > 0 and t_fut.size > 0:
         ax.plot(
             [float(t_hist[-1]), float(t_fut[0])],
             [float(hist[-1, c]), float(true_fut[0, c])],
-            color="black",
-            linewidth=2.0,
-            linestyle="-",
-            solid_capstyle="round",
-            zorder=4,
+            color="0.45",
+            linewidth=1.1,
+            linestyle="--",
+            alpha=0.85,
+            zorder=3,
             label="_nolegend",
         )
     for i, (name, p) in enumerate(preds_draw.items()):
@@ -345,8 +375,6 @@ def plot_forecast_compare(
 
 def plot_forecast_compare_two_panels(
     path: Path,
-    t_hist: np.ndarray,
-    t_fut: np.ndarray,
     panels: list[tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]],
     ylabel: str,
     title: str = "Forecast comparison",
@@ -354,13 +382,22 @@ def plot_forecast_compare_two_panels(
     panel_titles: list[str] | None = None,
     y_zoom_forecast: bool = True,
     anchor_forecast_boundary: bool = True,
+    hist_anchor_index: int = -1,
 ) -> None:
     """
     上下两子图：同一通道下，两个测试窗各一条「历史+真值+多模型未来」。
-    用于与单窗 overlay 图对照（不是「两个表格」——终端只打印一张指标表；文件为一张双面板图）。
+    时间轴由 **第一窗** 的 ``hist`` / ``true_fut`` 长度推导；其余窗须相同 Lh/Lf。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     c = int(channel)
+    h0, f0, _ = panels[0]
+    if h0.ndim == 1:
+        h0 = h0.reshape(-1, 1)
+    if f0.ndim == 1:
+        f0 = f0.reshape(-1, 1)
+    lh, lf = int(h0.shape[0]), int(f0.shape[0])
+    t_hist = np.arange(lh)
+    t_fut = np.arange(lh, lh + lf)
     n = len(panels)
     fig_h = min(2.9 * n + 0.5, 14.0)
     fig, axes = plt.subplots(n, 1, figsize=(9.0, fig_h), sharex=True, squeeze=False)
@@ -371,7 +408,13 @@ def plot_forecast_compare_two_panels(
             hist = hist.reshape(-1, 1)
         if true_fut.ndim == 1:
             true_fut = true_fut.reshape(-1, 1)
-        preds_draw = _anchor_preds_to_hist_end(hist, preds, c, anchor_forecast_boundary)
+        if int(hist.shape[0]) != lh or int(true_fut.shape[0]) != lf:
+            raise ValueError(
+                f"plot_forecast_compare_two_panels: panel {j} 的 Lh/Lf 与首窗 ({lh},{lf}) 不一致"
+            )
+        preds_draw = _anchor_preds_to_hist_end(
+            hist, preds, c, anchor_forecast_boundary, hist_anchor_index
+        )
         ax.plot(
             t_hist, hist[:, c], label="history", color="0.2", linewidth=0.95, alpha=0.9
         )
@@ -387,10 +430,11 @@ def plot_forecast_compare_two_panels(
             ax.plot(
                 [float(t_hist[-1]), float(t_fut[0])],
                 [float(hist[-1, c]), float(true_fut[0, c])],
-                color="black",
-                linewidth=1.75,
-                linestyle="-",
-                zorder=4,
+                color="0.45",
+                linewidth=1.0,
+                linestyle="--",
+                alpha=0.85,
+                zorder=3,
                 label="_nolegend",
             )
         for i, (name, p) in enumerate(preds_draw.items()):
@@ -423,21 +467,18 @@ def plot_forecast_compare_two_panels(
 def plot_forecast_grid(
     path: Path,
     examples: list[dict],
-    seq_len: int,
     pred_len: int,
     ylabel: str,
     title: str = "Forecast comparison (test samples)",
 ) -> None:
     """
-    examples: 每项含 hist (Lh,C), true (Lf,C), preds dict name -> (Lf,C)
+    examples: 每项含 hist (Lh,C), true (Lf,C), preds dict name -> (Lf,C)；Lh 可为 seq_len 或 multiscale 全长。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     n = len(examples)
     ncols = 2
     nrows = int(np.ceil(n / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(11, 3.5 * nrows), squeeze=False)
-    t_hist = np.arange(seq_len)
-    t_fut = np.arange(seq_len, seq_len + pred_len)
     c = 0
     for i, ex in enumerate(examples):
         r, col = divmod(i, ncols)
@@ -448,6 +489,9 @@ def plot_forecast_grid(
             h = h.reshape(-1, 1)
         if tr.ndim == 1:
             tr = tr.reshape(-1, 1)
+        lh = int(h.shape[0])
+        t_hist = np.arange(lh)
+        t_fut = np.arange(lh, lh + int(pred_len))
         ax.plot(t_hist, h[:, c], color="black", linewidth=1.0, label="hist")
         ax.plot(t_fut, tr[:, c], color="black", linewidth=1.8, label="true")
         for j, (name, p) in enumerate(ex["preds"].items()):
@@ -460,7 +504,7 @@ def plot_forecast_grid(
                 label=name,
                 color=plt.cm.tab10(j % 10),
             )
-        ax.axvline(seq_len - 0.5, color="gray", linestyle=":", linewidth=0.8)
+        ax.axvline(lh - 0.5, color="gray", linestyle=":", linewidth=0.8)
         ax.set_ylabel(ylabel)
         ax.set_title(f"sample {i + 1}")
         ax.legend(fontsize=7, loc="best")
@@ -475,8 +519,6 @@ def plot_forecast_grid(
 
 def plot_forecast_predictive_intervals(
     path: Path,
-    t_hist: np.ndarray,
-    t_fut: np.ndarray,
     hist: np.ndarray,
     true_fut: np.ndarray,
     samples_k_lc: np.ndarray,
@@ -490,12 +532,21 @@ def plot_forecast_predictive_intervals(
 ) -> None:
     """
     samples_k_lc: (K, Lf, C) 原始尺度；画分位阴影 + 真值 + 可选点预测。
+    时间轴由 hist / true_fut 长度推导（与 plot_forecast_compare 一致）。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if hist.ndim == 1:
         hist = hist.reshape(-1, 1)
     if true_fut.ndim == 1:
         true_fut = true_fut.reshape(-1, 1)
+    lh = int(hist.shape[0])
+    lf = int(true_fut.shape[0])
+    if int(samples_k_lc.shape[1]) != lf:
+        raise ValueError(
+            f"plot_forecast_predictive_intervals: 样本轴长度 {samples_k_lc.shape[1]} != Lf={lf}"
+        )
+    t_hist = np.arange(lh)
+    t_fut = np.arange(lh, lh + lf)
     s = samples_k_lc[..., channel]
     lo = np.quantile(s, q_low, axis=0)
     hi = np.quantile(s, q_high, axis=0)

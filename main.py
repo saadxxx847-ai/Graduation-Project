@@ -121,6 +121,18 @@ def forecast_overlay_time_axes(cfg: Config) -> tuple[np.ndarray, np.ndarray]:
     return np.arange(ehl), np.arange(ehl, ehl + pl)
 
 
+def thesis_overlay_hist_anchor_index(cfg: Config) -> int:
+    """
+    多尺度 history 末 token 为日/周池化，与真值首步在时间上不连续。
+    Overlay 的边界锚定与 history→GT 连线应取细粒度段末 index = seq_len-1。
+    """
+    if bool(getattr(cfg, "use_multiscale_hist", False)) and int(cfg.effective_hist_len()) > int(
+        cfg.seq_len
+    ):
+        return int(cfg.seq_len) - 1
+    return -1
+
+
 @torch.no_grad()
 def evaluate_test_loader(
     model: SimDiffWeather,
@@ -496,8 +508,6 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
             torch.cuda.empty_cache()
         _clear_ms_rms_key(cfg)
 
-    t_hist = np.arange(cfg.seq_len)
-    t_fut = np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len)
     ref_key = (
         "baseline"
         if "baseline" in evaluated_variant_keys
@@ -535,8 +545,6 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
     p_ol = rdir / cfg.result_png_basename("forecast_ms_rms_ablation_overlay")
     plot_forecast_compare(
         p_ol,
-        t_hist,
-        t_fut,
         hist_plot,
         fb_ref[0].detach().cpu().numpy(),
         preds_overlay,
@@ -633,7 +641,6 @@ def run_revin_rms_ablation_suite(
     hb1, fb1 = next(iter(test_loader))
     hb1 = hb1.to(device)
     fb1 = fb1.to(device)
-    t_hist, t_fut = forecast_overlay_time_axes(cfg)
 
     for key, label in _REVIN_RMS_ABLATION_SPECS:
         _apply_denoiser_ablation_key(cfg, key)
@@ -707,14 +714,13 @@ def run_revin_rms_ablation_suite(
     p_ol = rdir / cfg.result_png_basename("forecast_curves_denoiser_ablation_overlay")
     plot_forecast_compare(
         p_ol,
-        t_hist,
-        t_fut,
         hb1[0].cpu().numpy(),
         fb1[0].cpu().numpy(),
         preds_overlay,
         ylabel=plot_ylab,
         title=f"[{plot_slug}] Denoiser ablation overlay / {plot_ylab} / batch 0",
         channel=t_idx,
+        hist_anchor_index=thesis_overlay_hist_anchor_index(cfg),
         gt_peek_blend=float(cfg.thesis_plot_gt_peek_simdiff),
         gt_peek_name_prefix="SimDiff",
     )
@@ -1381,8 +1387,6 @@ def main() -> None:
             p_int = cfg.resolved_plot_dir() / "forecast_predictive_intervals.png"
             plot_forecast_predictive_intervals(
                 p_int,
-                np.arange(cfg.effective_hist_len()),
-                np.arange(cfg.seq_len, cfg.seq_len + cfg.pred_len),
                 hist_1,
                 true_1,
                 samp,
@@ -1403,7 +1407,6 @@ def main() -> None:
     plot_dir = cfg.resolved_plot_dir()
     c_vis = t_idx if t_idx < n_features else min(1, n_features - 1)
     ylabel = feat_names[c_vis] if c_vis < len(feat_names) else str(c_vis)
-    t_hist, t_fut = forecast_overlay_time_axes(cfg)
 
     if not cfg.thesis_result_only and not args.skip_denoise_traj:
         hd0, fd0 = next(iter(test_loader))
@@ -1599,14 +1602,13 @@ def main() -> None:
             p_cmp = plot_dir / "forecast_compare_example.png"
             plot_forecast_compare(
                 p_cmp,
-                t_hist,
-                t_fut,
                 hist0,
                 true0,
                 pred_dict,
                 ylabel=ylabel,
                 title=f"Forecast comparison (first test batch sample) — {temp_name}",
                 channel=t_idx,
+                hist_anchor_index=thesis_overlay_hist_anchor_index(cfg),
             )
             print(f"Saved plot: {p_cmp}")
 
@@ -1624,7 +1626,6 @@ def main() -> None:
             plot_forecast_grid(
                 p_grid,
                 grid_ex,
-                _ehl,
                 cfg.pred_len,
                 ylabel=ylabel,
                 title=f"Forecast comparison — {temp_name}",
@@ -1690,10 +1691,14 @@ def main() -> None:
         true0 = fut[0].cpu().numpy()
         pred0 = point_prediction_from_forecast(fo, cfg)[0].cpu().numpy()
 
+        _lh_ex = int(hist0.shape[0])
+        _lf_ex = int(true0.shape[0])
+        _th_ex = np.arange(_lh_ex)
+        _tf_ex = np.arange(_lh_ex, _lh_ex + _lf_ex)
         plt.figure(figsize=(10, 4))
-        plt.plot(t_hist, hist0[:, c_vis], label="history", color="C0")
-        plt.plot(t_fut, true0[:, c_vis], label="ground truth", color="black")
-        plt.plot(t_fut, pred0[:, c_vis], label=_sdn, color="C2", linestyle="--")
+        plt.plot(_th_ex, hist0[:, c_vis], label="history", color="C0")
+        plt.plot(_tf_ex, true0[:, c_vis], label="ground truth", color="black")
+        plt.plot(_tf_ex, pred0[:, c_vis], label=_sdn, color="C2", linestyle="--")
         plt.axvline(int(cfg.effective_hist_len()) - 0.5, color="gray", linestyle=":")
         plt.xlabel("time step (index)")
         plt.ylabel(ylabel)
@@ -1781,14 +1786,13 @@ def main() -> None:
         )
     plot_forecast_compare(
         p1,
-        t_hist,
-        t_fut,
         hb1[0].cpu().numpy(),
         fb1[0].cpu().numpy(),
         preds1,
         ylabel=temp_name,
         title=f"[{slug}] Forecast overlay / {temp_name} / batch 0",
         channel=ch,
+        hist_anchor_index=thesis_overlay_hist_anchor_index(cfg),
         gt_peek_blend=float(cfg.thesis_plot_gt_peek_simdiff),
     )
     print(f"[毕设] {p1}")
