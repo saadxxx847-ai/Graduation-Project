@@ -123,13 +123,14 @@ def forecast_overlay_time_axes(cfg: Config) -> tuple[np.ndarray, np.ndarray]:
 
 def thesis_overlay_hist_anchor_index(cfg: Config) -> int:
     """
-    多尺度 history 末 token 为日/周池化，与真值首步在时间上不连续。
-    Overlay 的边界锚定与 history→GT 连线应取细粒度段末 index = seq_len-1。
+    仅用于 ``plot_forecast_compare`` 的 **仅展示** 竖直平移（``anchor_forecast_boundary``）：
+    使各模型预测未来第一步与 **图中 history 曲线终点同 y**。
+
+    多尺度时若取 ``seq_len-1``，锚在细粒度末格，而折线终点为 ``hist[Lh-1]``（池化尾），
+    会与三条预测起点错位；统一取末格 ``-1`` 与图示轨迹衔接。
+    （终端 MAE/MSE/CRPS 仍用未平移预测；GT 仍为真实 ``true_fut``。）
     """
-    if bool(getattr(cfg, "use_multiscale_hist", False)) and int(cfg.effective_hist_len()) > int(
-        cfg.seq_len
-    ):
-        return int(cfg.seq_len) - 1
+    _ = cfg
     return -1
 
 
@@ -800,6 +801,14 @@ def main() -> None:
         help="关闭多尺度拼接，仅 seq_len 步原始历史（与 iTransformer/TimeMixer 长度一致，便于同训基线）",
     )
     parser.add_argument(
+        "--multiscale_steps_per_hour",
+        type=int,
+        default=None,
+        metavar="SPH",
+        help="多尺度日/周池化的日历语义：每小时原始采样点数（1=ETTh 类每小时一步，4=ETTm 15min）。"
+        "不传则由数据文件名推断（stem 含 ettm 时为 4，否则为 1）。",
+    )
+    parser.add_argument(
         "--seq_len",
         type=int,
         default=None,
@@ -1042,6 +1051,8 @@ def main() -> None:
         cfg.test_batch_size = max(1, int(args.test_batch_size))
     if args.seq_len is not None:
         cfg.seq_len = args.seq_len
+    if getattr(args, "multiscale_steps_per_hour", None) is not None:
+        cfg.multiscale_steps_per_hour = max(1, int(args.multiscale_steps_per_hour))
     if args.pred_len is not None:
         cfg.pred_len = max(1, int(args.pred_len))
     if args.ckpt_extra_suffix is not None:
@@ -1214,9 +1225,15 @@ def main() -> None:
         f"use_ema={cfg.use_ema}（decay={cfg.ema_decay}，checkpoint 存 EMA）"
     )
     mode = "仅气温单变量" if cfg.temperature_only else "全部气象变量"
+    _sph = getattr(cfg, "multiscale_steps_per_hour", None)
+    _hwm = getattr(cfg, "hist_window_start_min", 0)
+    _extra_ms = ""
+    if cfg.use_multiscale_hist:
+        _extra_ms = f", multiscale_steps_per_hour={_sph}, hist_window_start_min={_hwm}"
     print(
         f"特征维度 C={n_features}（{mode}）, 列: {feat_names} | "
         f"RevIn={cfg.use_revin}, RMSNorm={cfg.use_rmsnorm}, multiscale_hist={cfg.use_multiscale_hist}"
+        f"{_extra_ms}"
     )
     print(
         f"Normalization Independence: 历史/未来分算 μ,σ；"
@@ -1336,7 +1353,14 @@ def main() -> None:
         var_mean_fulltest,
         crps_h_fulltest,
     ) = evaluate_test_loader_prob_combined(
-        model, test_loader, device, n_features, t_idx, cfg.pred_len, cfg
+        model,
+        test_loader,
+        device,
+        n_features,
+        t_idx,
+        cfg.pred_len,
+        cfg,
+        progress_desc="测试集 SimDiff (K-sample)",
     )
     if not cfg.thesis_result_only:
         print(

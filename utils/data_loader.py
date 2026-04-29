@@ -12,22 +12,58 @@ from torch.utils.data import DataLoader, Dataset
 
 from config.config import Config
 
-# 多尺度：168=7×24（日窗），672=4×168（周窗）；需在窗口起点 i 之前保留足够上下文 → i>=576
-_MULTISCALE_PREFIX = 672 - 96
+
+def resolve_multiscale_steps_per_hour(cfg: Config, data_stem: str) -> int:
+    """
+    多尺度池化块的「日历跨度」依赖采样间隔：
+    - ETTh / hourly：每小时 1 步 → steps_per_hour=1（默认）。
+    - ETTm / 15min：每小时 4 步 → steps_per_hour=4。
+    显式 cfg.multiscale_steps_per_hour>0 时优先；否则文件名含 ``ettm`` 推断为 4，其余为 1。
+    """
+    explicit = getattr(cfg, "multiscale_steps_per_hour", None)
+    if explicit is not None and int(explicit) > 0:
+        return int(explicit)
+    s = data_stem.lower()
+    if "ettm" in s:
+        return 4
+    return 1
+
+
+def multiscale_window_start_min(seq_len: int, steps_per_hour: int) -> int:
+    """
+    多尺度拼接需在 anchor=i+seq_len 左侧取完整「日池化窗 + 周池化窗」。
+    周池化回溯最长 → wmin = weekly_blk - seq_len。
+    hourly：weekly_blk=672 → wmin=576；15min：weekly_blk=2688 → wmin=2592。
+    """
+    sph = max(1, int(steps_per_hour))
+    spd = 24 * sph
+    weekly_blk = 28 * spd
+    return max(0, int(weekly_blk) - int(seq_len))
 
 
 def _concat_multiscale_history(
     data: np.ndarray,
     window_start: int,
     seq_len: int,
+    steps_per_hour: int = 1,
 ) -> np.ndarray:
-    """拼接 [seq_len 原始步 | 7×日平均 | 4×周平均]，shape (seq_len+11, C)。window_start 为当前样本历史起点 i。"""
+    """
+    拼接 [seq_len 原始步 | 7×日尺度平均 | 4×周尺度平均]，shape (seq_len+11, C)。
+    window_start 为当前样本历史起点 i。
+
+    steps_per_hour=1（每小时一步）：与旧版一致——日窗 168=7×24 小时步，周窗 672=28×24。
+    steps_per_hour=4（15min）：日窗 672=7×96 步（仍 7 天），周窗 2688=28×96（仍 28 天）。
+    """
+    sph = max(1, int(steps_per_hour))
+    spd = 24 * sph  # steps per calendar day
+    daily_blk = 7 * spd
+    weekly_blk = 28 * spd
     anchor = window_start + seq_len
     fine = data[window_start : window_start + seq_len]
-    blk168 = data[anchor - 168 : anchor]
-    daily = blk168.reshape(7, 24, -1).mean(axis=1)
-    blk672 = data[anchor - 672 : anchor]
-    weekly = blk672.reshape(4, 168, -1).mean(axis=1)
+    blk_d = data[anchor - daily_blk : anchor]
+    daily = blk_d.reshape(7, spd, -1).mean(axis=1)
+    blk_w = data[anchor - weekly_blk : anchor]
+    weekly = blk_w.reshape(4, daily_blk, -1).mean(axis=1)
     return np.concatenate([fine, daily, weekly], axis=0).astype(np.float32)
 
 
@@ -59,16 +95,19 @@ class WeatherWindowDataset(Dataset):
         *,
         multiscale: bool = False,
         window_start_min: int = 0,
+        steps_per_hour: int = 1,
     ):
         """
         data: (T, C) 全序列
         window_start_min: 允许的最早窗口起点索引 i（相对本段 data 下标 0）。
         multiscale: True 时历史为 seq_len+11 步拼接向量（仍为一通道标量每步）。
+        steps_per_hour: 仅 multiscale 时用；决定日/周池化回溯步数（见 _concat_multiscale_history）。
         """
         self.data = data.astype(np.float32)
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.multiscale = bool(multiscale)
+        self.steps_per_hour = max(1, int(steps_per_hour))
         self.window_start_min = int(window_start_min)
         self.n = len(data) - seq_len - pred_len + 1 - self.window_start_min
         if self.n <= 0:
@@ -84,7 +123,9 @@ class WeatherWindowDataset(Dataset):
         i = idx + self.window_start_min
         fut = self.data[i + self.seq_len : i + self.seq_len + self.pred_len]
         if self.multiscale:
-            hist = _concat_multiscale_history(self.data, i, self.seq_len)
+            hist = _concat_multiscale_history(
+                self.data, i, self.seq_len, self.steps_per_hour
+            )
         else:
             hist = self.data[i : i + self.seq_len]
         return torch.from_numpy(hist), torch.from_numpy(fut)
@@ -142,9 +183,11 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
     cfg.input_dim = C
 
     ms = bool(getattr(cfg, "use_multiscale_hist", False))
+    sph = resolve_multiscale_steps_per_hour(cfg, path.stem)
+    cfg.multiscale_steps_per_hour = sph
     wmin = int(getattr(cfg, "hist_window_start_min", 0))
     if ms:
-        wmin = max(wmin, _MULTISCALE_PREFIX)
+        wmin = max(wmin, multiscale_window_start_min(cfg.seq_len, sph))
         cfg.hist_window_start_min = wmin
 
     train_end = int(T * cfg.train_ratio)
@@ -155,13 +198,28 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
     test_mat = matrix[val_end:]
 
     train_ds = WeatherWindowDataset(
-        train_mat, cfg.seq_len, cfg.pred_len, multiscale=ms, window_start_min=wmin
+        train_mat,
+        cfg.seq_len,
+        cfg.pred_len,
+        multiscale=ms,
+        window_start_min=wmin,
+        steps_per_hour=sph,
     )
     val_ds = WeatherWindowDataset(
-        val_mat, cfg.seq_len, cfg.pred_len, multiscale=ms, window_start_min=wmin
+        val_mat,
+        cfg.seq_len,
+        cfg.pred_len,
+        multiscale=ms,
+        window_start_min=wmin,
+        steps_per_hour=sph,
     )
     test_ds = WeatherWindowDataset(
-        test_mat, cfg.seq_len, cfg.pred_len, multiscale=ms, window_start_min=wmin
+        test_mat,
+        cfg.seq_len,
+        cfg.pred_len,
+        multiscale=ms,
+        window_start_min=wmin,
+        steps_per_hour=sph,
     )
 
     fut_mu, fut_sig = fit_future_marginal_stats(train_ds)

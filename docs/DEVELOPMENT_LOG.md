@@ -8,7 +8,7 @@
 
 - 一次改动对应一个小节，包含：目标摘要、动过的文件、配置项、与既有逻辑的关系、备注（权重兼容性等）。
 - 与论文/开题报告对应的表述可引用本节中的「设计说明」。
-- **每次迭代**（含自动化改动）：凡涉及 **CLI、消融语义、权重命名、`result/`/`xiaorong/` 产出** 等可追溯行为，须在文末 **追加** 小节记录；勿仅靠口头或零散注释。
+- **每次迭代**（含自动化改动、助手/Cursor 批量改动）：凡涉及 **CLI、消融语义、权重命名、`result/`/`xiaorong/` 产出、`compare_viz`/毕设图语义** 等可追溯行为，须在文末 **追加** 小节记录；勿仅靠口头或零散注释。
 
 ---
 
@@ -1068,5 +1068,119 @@ python main.py --data_path data/ETTh1.csv --figures_dir ETTh1 \
 ## 2026-04-29：预报起点装饰（底色/圆点）已撤回
 
 - **曾**在 overlay 上加 ``[Lh-1,Lh]`` 浅底色与末/首点 scatter；用户反馈后 **已恢复**为仅 **``ax.axvline(..., gray : )``** 的简单分界（与此前习惯一致）。
+
+---
+
+## 2026-04-29：ETTm1（15min）单变量 OT 预测、毕设图写入 `ETTm1/`
+
+### 数据与 CLI
+
+- 文件：`data/ETTm1.csv`；默认 **`temperature_only=True`** 时只取 **`OT`** 列（与 ETTh1 / weather 单变量流程一致）。
+- **训练 + 对比基线 + 毕设图 + 终端指标表**（无代码改动，沿用 `main.py`）：
+
+```bash
+python main.py --data_path data/ETTm1.csv --figures_dir ETTm1 \
+  --ckpt_extra_suffix _ettm1_ot
+```
+
+- 权重：`checkpoints/simdiff_weather_best_ettm1_ot.pt`（勿与其他数据集后缀混用以免覆盖）。
+- 仅评估（已有权重后）：同上命令加 **`--eval_only`**（基线仍会当场重训至早停）。
+
+### 本轮产出示例（文件名含时间戳后缀）
+
+| 路径 | 说明 |
+|------|------|
+| `ETTm1/bar_mae_mse_temperature_<suffix>.png` | SimDiff vs iTransformer vs TimeMixer 的 MAE/MSE 柱状图 |
+| `ETTm1/forecast_curves_temperature_overlay_<suffix>.png` | 真值 + 三模型预测折线叠加（test batch 0） |
+| 终端 `print_thesis_metrics_table` | OT 通道：**MAE / MSE / CRPS / VAR**（点预测两行：CRPS=MAE，VAR=0） |
+
+### 备注
+
+- ETTm1 为 **15 分钟**采样；多尺度日历语义已与 ETTh 对齐方式见文末 **「ETTm 多尺度池化日历对齐」**（`multiscale_steps_per_hour=4`，勿再按旧版 168/672 解释为「与 ETTh 相同日历窗」）。
+- 本次完整跑（早停约 epoch 43）：示例数值（仅作存档）：SimDiff MAE≈0.393、MSE≈0.389、CRPS≈0.276、VAR≈0.314；基线 MAE 高于 SimDiff。
+
+---
+
+## 2026-04-29：毕设 overlay 竖直锚点改为 history **末格**（`-1`）
+
+### 现象
+
+- 多尺度下 history 长度为 `Lh=seq_len+11`，绘图锚点若取 **`seq_len-1`**（细粒度末步），`_anchor_preds_to_hist_end` 会把三条预测曲线的第一步对齐到 **`hist[seq_len-1]`**。
+- 折线 **`history`** 仍画满 `0..Lh-1`，终点为 **`hist[Lh-1]`**（池化尾），与锚点取值不同 → 分界处三条模型曲线与 history **看似不在同一衔接高度**。
+
+### 改动
+
+- **`main.py`**：`thesis_overlay_hist_anchor_index` 改为恒返回 **`-1`**（末 conditioning token），使展示用平移后的预测第一步与 **图中 history 终点**同 y。
+- **不影响**：终端 MAE/MSE/CRPS（仍为未平移预测）；ground truth 仍为真实 `true_fut`。竖直对齐与「折线在虚线处是否一笔连成」属不同层面，后者见下文 **overlay 边界衔接绘制**。
+
+---
+
+## 2026-04-29：ETTm 多尺度池化日历对齐（fixed 168/672 按小时硬编码）
+
+### 问题
+
+- `_concat_multiscale_history` 中日窗 **168**、周窗 **672** 对应 **每小时一步**（ETTh）：168 步 = 7 天、672 步 = 28 天。
+- **ETTm（15min）** 若仍用 168/672，则仅约 **42 小时 / 7 天**，与「日/周尺度」设计不符。
+
+### 改动
+
+| 文件 | 说明 |
+|------|------|
+| `config/config.py` | `multiscale_steps_per_hour: Optional[int]`（`None`=自动）。 |
+| `utils/data_loader.py` | `resolve_multiscale_steps_per_hour`（文件名含 `ettm`→4，否则→1）；`multiscale_window_start_min(seq_len,sph)`；`_concat_multiscale_history(..., steps_per_hour)` 中日窗 `7×24×sph`、周窗 `28×24×sph`。 |
+| `utils/trainer.py` | checkpoint `meta` 增加 `multiscale_steps_per_hour`。 |
+| `main.py` | `--multiscale_steps_per_hour`；打印 `multiscale_steps_per_hour` 与 `hist_window_start_min`。 |
+
+### 兼容性
+
+- **ETTh / weather**：`steps_per_hour=1`，行为与旧版一致（`wmin=576`）。
+- **ETTm**：`steps_per_hour=4`，`wmin=2592`；**须在 ETTm 上删除旧 checkpoint 并重训**，旧权重输入分布已变。
+
+### 关于「数据泄漏 / 索引错误」（评审常见质疑）
+
+- `WeatherWindowDataset.__getitem__`：`fut = data[i+seq_len : ...]`，`hist`（含池化段）仅用 **索引 `< i+seq_len`** 的历史片段；未见未来标签泄入 conditioning。
+- 「三模型均值回归」多为任务/容量/训练现象；池化对齐后可再评估，非单靠改索引可证伪。
+
+---
+
+## 2026-04-29：`compare_viz` overlay 折线在竖虚线处「断开」— 边界衔接绘制
+
+### 现象
+
+- `history` 与「GT / 各模型未来」原为 **两次独立** ``ax.plot``（``x`` 分别为 ``0..Lh-1`` 与 ``Lh..``），Matplotlib **不会**自动绘制 ``(Lh-1)→(Lh)`` 的连线，竖虚线两侧看起来像「断了」。
+- 原先仅用 **灰色虚线** 连接 ``hist[Lh-1]`` → ``true_fut[0]``，**未**与各彩色预测线衔接。
+
+### 改动
+
+| 文件 | 说明 |
+|------|------|
+| `utils/compare_viz.py` | 新增 ``_t_fut_with_bridge``；``plot_forecast_compare`` / ``plot_forecast_compare_two_panels`` 对 GT 与每条预测在 ``x`` 轴插入 ``Lh-1``，``y`` 首点为 ``hist[-1,c]``，与未来段连成 **一条折线**；去掉单独的灰虚线段（黑色 GT 粗线已覆盖 ``Lh-1→Lh`` 的首段）。 |
+
+### 语义
+
+- **仅绘图**：不改变磁盘评估指标；锚平移逻辑仍为 `_anchor_preds_to_hist_end`。
+- **竖虚线**仍位于 ``Lh-0.5``，用于分隔 conditioning 与未来时段。
+
+---
+
+## 2026-04-29：核查 `bug/3.txt`「NI 泄漏」论断、单尺度 overlay 观感、SimDiff 验证指标可选
+
+### 1. 对外部「用 hist μ/σ 反变换未来」建议的结论
+
+- **`bug/3.txt`** 主张将 `_future_mu_sig_for_inverse` 改为仅用 history 估计 μ、σ，并声称当前「训练推理归一化不一致」。
+- **本仓库结论**：该改法 **不适用**。SimDiff 采用 **Normalization Independence**（见 `utils/independent_normalizer.py`）：训练目标在 **`normalize_future(future)`** 空间；评估 **有真值** 时用 **同一 batch 的 μ_f、σ_f** 反变换，与 `training_loss` **一致**；**无真值** 时用 **`make_loaders` 写入的训练集未来边际** μ、σ。
+- **勿**在未同步改写 `training_loss` / `normalize_future` 的前提下改用 hist 统计量反变换未来，否则会破坏 NI 语义。
+- **`models/simdiff.py`** 模块注释已简短重申上述边界，避免后续误改。
+
+### 2. 为何 `--single_scale_hist` 下图「更像从同一点出发」
+
+- 单尺度时 **`Lh=seq_len`**，灰色 history 与 `BaselineHistTrim` 消费的序列长度一致；多尺度时 **`Lh=seq_len+11`**，末端为池化 token，曾与可视化锚点产生观感差异（参见前文 overlay 锚点与边界衔接条目）。
+- 叠加 **`compare_viz`** 边界衔接绘制后，两类设定均应从图上连贯延伸；若仍觉得多尺度难解释，可优先用单尺度做对照实验。
+
+### 3. SimDiff 在单尺度 ETTm 上弱于 iTransformer / TimeMixer — 现象说明
+
+- **现象**：直接回归类基线在 **原始尺度** 上优化；SimDiff **早停 / LR 调度**依据 **`Trainer.validate()` 的扩散噪声训练损失**（`training_loss`），与终端报告的 **原始尺度 MAE** 不完全同一目标，可能出现「噪声损失好但曲线一般」的 checkpoint。
+- **曾尝试（已撤回）**：验证阶段改用 **MoM 预报 MAE**（`forecast_mae`）做早停，与 overlay 更对齐，但 **每 epoch 需完整扩散采样**，训练 **过慢**，已 **从代码中移除**；当前 **`validate()` 仅保留噪声损失**（与最初行为一致）。
+- 若需原始尺度意义上的「好权重」，可调 `epochs` / `learning_rate` / 模型宽度，或以 **`--eval_only` 在若干 checkpoint 上扫测试 MAE**（不塞进每个 epoch 的 validate）。
 
 ---

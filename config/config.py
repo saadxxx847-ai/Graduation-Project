@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -31,8 +31,10 @@ class Config:
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # 滑动窗口起点 i 的最小值（相对各自划分后的序列）；用于与多尺度所需向左上下文对齐。
-    # 多尺度融合需要 anchor 前至少 672 步，故 i>=576；开 multiscale 时 make_loaders 会把下界抬到 576。
+    # 多尺度「向左看」长度取决于日历语义（见 multiscale_steps_per_hour）；make_loaders 内计算并写回本字段。
     hist_window_start_min: int = 0
+    # 多尺度池化的日历语义：每小时有多少个原始步（ETTh=1，ETTm 15min=4）。None 时在 make_loaders 中按文件名推断。
+    multiscale_steps_per_hour: Optional[int] = None
     # True：历史为 [seq_len 原始 | 7×日均值 | 4×周均值] 共 seq_len+11 步拼接（默认开；见 main --single_scale_hist 关闭）
     use_multiscale_hist: bool = True
 

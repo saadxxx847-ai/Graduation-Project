@@ -39,7 +39,9 @@ def _simdiff_series_name(name: str) -> bool:
 
 
 def _linestyle_for_pred(name: str, i: int) -> tuple[str, str]:
-    """易区分线型：SimDiff 实线（多子变体时分色），iTransformer 虚线，TimeMixer 点划。"""
+    """Forecast 叠加（与旧版毕设图一致）：SimDiff 蓝实线；iTransformer 橙虚线；TimeMixer 绿点划线。
+
+    图例色块与线色一致（tab10 蓝/橙/绿）；仅预测曲线线型区分。"""
     if _simdiff_series_name(name):
         colors = (
             "#1f77b4",
@@ -105,6 +107,11 @@ def _resolve_hist_anchor_index(hist: np.ndarray, hist_anchor_index: int) -> int:
     else:
         ai = int(hist_anchor_index)
     return int(min(max(ai, 0), lh - 1))
+
+
+def _t_fut_with_bridge(t_hist: np.ndarray, t_fut: np.ndarray) -> np.ndarray:
+    """未来段 x：在首点前插入 ``t_hist[-1]``，使与 history 终点同一折线相连。"""
+    return np.concatenate([np.asarray([float(t_hist[-1])], dtype=np.float64), np.asarray(t_fut, dtype=np.float64)])
 
 
 def _anchor_preds_to_hist_end(
@@ -287,11 +294,13 @@ def plot_forecast_compare(
     gt_peek_name_prefix: str = "SimDiff",
 ) -> None:
     """
-    单窗口：历史 + 真值未来 + 多模型预测。
+    单窗口：历史 + 真值未来 + 多模型预测；图例与各模型曲线颜色、线型一一对应。
 
     **横轴**：始终由 ``hist.shape[0]`` 与 ``true_fut.shape[0]`` 推导：
     ``t_hist = 0..Lh-1``，``t_fut = Lh .. Lh+Lf-1``，避免调用方误传 ``seq_len`` 起点导致
     ground truth 与多尺度 history 在 x 轴上重叠（旧 bug）。
+
+    **分界衔接**：GT 与各模型预测在绘制时于 ``x=Lh-1`` 处重复首点前缀，使折线从 history 末端连续画入未来段（否则 matplotlib 两段 ``plot`` 会在虚线处看起来「断开」）。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     c = int(channel)
@@ -321,34 +330,24 @@ def plot_forecast_compare(
         )
     fig, ax = plt.subplots(figsize=(9.5, 3.6))
     ax.plot(t_hist, hist[:, c], label="history", color="0.2", linewidth=1.0, alpha=0.9)
+    # 与未来共用同一 Line2D：从 history 终点 (Lh-1) 画进未来首步 (Lh)，避免「折线在虚线处断开」的观感
+    y_hist_end = float(hist[-1, c])
+    t_bridge = _t_fut_with_bridge(t_hist, t_fut)
     ax.plot(
-        t_fut,
-        true_fut[:, c],
+        t_bridge,
+        np.concatenate([[y_hist_end], np.asarray(true_fut[:, c], dtype=np.float64).ravel()]),
         label="ground truth",
         color="black",
         linewidth=2.0,
         zorder=4,
     )
-    # 仅连接 conditioning **最后一格** (Lh-1) 与未来首格 (Lh)，不再从细粒度末步拉长线跨过池化段，
-    # 否则粗黑斜线与 GT 同色同宽，在虚线左侧很长一段会被误认为「真值画进 history」。
-    if t_hist.size > 0 and t_fut.size > 0:
-        ax.plot(
-            [float(t_hist[-1]), float(t_fut[0])],
-            [float(hist[-1, c]), float(true_fut[0, c])],
-            color="0.45",
-            linewidth=1.1,
-            linestyle="--",
-            alpha=0.85,
-            zorder=3,
-            label="_nolegend",
-        )
     for i, (name, p) in enumerate(preds_draw.items()):
         arr = p[:, c] if p.ndim > 1 else p
-        arr = np.asarray(arr, dtype=np.float64)
+        arr = np.asarray(arr, dtype=np.float64).ravel()
         col, sty = _linestyle_for_pred(name, i)
         ax.plot(
-            t_fut,
-            arr,
+            t_bridge,
+            np.concatenate([[y_hist_end], arr]),
             linestyle=sty,
             label=name,
             color=col,
@@ -415,35 +414,26 @@ def plot_forecast_compare_two_panels(
         preds_draw = _anchor_preds_to_hist_end(
             hist, preds, c, anchor_forecast_boundary, hist_anchor_index
         )
+        y_hist_end = float(hist[-1, c])
+        t_bridge = _t_fut_with_bridge(t_hist, t_fut)
         ax.plot(
             t_hist, hist[:, c], label="history", color="0.2", linewidth=0.95, alpha=0.9
         )
         ax.plot(
-            t_fut,
-            true_fut[:, c],
+            t_bridge,
+            np.concatenate([[y_hist_end], np.asarray(true_fut[:, c], dtype=np.float64).ravel()]),
             label="ground truth",
             color="black",
             linewidth=1.75,
             zorder=4,
         )
-        if t_hist.size > 0 and t_fut.size > 0:
-            ax.plot(
-                [float(t_hist[-1]), float(t_fut[0])],
-                [float(hist[-1, c]), float(true_fut[0, c])],
-                color="0.45",
-                linewidth=1.0,
-                linestyle="--",
-                alpha=0.85,
-                zorder=3,
-                label="_nolegend",
-            )
         for i, (name, p) in enumerate(preds_draw.items()):
             arr = p[:, c] if p.ndim > 1 else p
-            arr = np.asarray(arr, dtype=np.float64)
+            arr = np.asarray(arr, dtype=np.float64).ravel()
             col, sty = _linestyle_for_pred(name, i)
             ax.plot(
-                t_fut,
-                arr,
+                t_bridge,
+                np.concatenate([[y_hist_end], arr]),
                 linestyle=sty,
                 label=name,
                 color=col,

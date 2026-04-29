@@ -2,7 +2,8 @@
 SimDiff-Weather：Normalization Independence + Median-of-Means 集成预测。
 
 * 历史与未来分别在各自时间维上估计 μ,σ，互不混用；网络条件为 normalize_history(hist, hist_stats_span=seq_len)（多尺度时仅用前 seq_len 步估计 μ_h,σ_h）。
-* 扩散目标在 normalize_future(future) 空间；评估时有真值则用 batch 的 μ_f,σ_f 反变换，无真值则用训练集未来边际统计量。
+* 扩散目标在 normalize_future(future) 空间；评估时有真值则用 batch 的 μ_f,σ_f 反变换（与 training_loss 目标空间一致）；无真值则用训练集未来边际。
+  **勿**将「反变换改用 hist 上 μ/σ」当作泄漏修复：那会破坏 NI，除非同步改写 normalize_future / training_loss（见 docs 与 utils/independent_normalizer.py）。
 """
 from __future__ import annotations
 
