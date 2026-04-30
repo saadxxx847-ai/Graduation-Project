@@ -1,0 +1,2 @@
+此目录用于「多变量 Wind（--all_features）」实验产出。
+训练或评估时请加：--figures_dir wind_experiments/multivariate

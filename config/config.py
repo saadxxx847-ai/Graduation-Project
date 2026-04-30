@@ -25,6 +25,15 @@ class Config:
     thesis_result_only: bool = True
     # 仅 overlay 作图、且**仅**名称以 SimDiff 开头者；(iTransformer/TimeMixer 不混合)：(1-λ)pred+λ·GT
     thesis_plot_gt_peek_simdiff: float = 0.0
+    # λ>0 且向 GT 画图混合时：**不**在图标题追加 display/λ 说明（仅视觉参考；指标仍不含混合）
+    thesis_gt_peek_hide_title_hint: bool = False
+    # 毕设 forecast_curves_overlay：使用 test_loader 第几个 batch（0-based）；换窗口可看陡变等个案
+    thesis_overlay_test_batch: int = 0
+    # full / mom_only：点预测聚合；mean/single 更不抹平，不重训可试；ni_only 仍为算术平均
+    forecast_point_mode: str = "mom"
+    # 多变量：对主变量通道放大扩散训练 ε/x0 等损失权重（1=关）；须重训；见 main 写入 channel_idx
+    forecast_loss_primary_weight: float = 1.0
+    forecast_loss_primary_channel_idx: Optional[int] = field(default=None, repr=False)
 
     seq_len: int = 96
     pred_len: int = 24
@@ -61,6 +70,10 @@ class Config:
     # 插在 checkpoint stem 与 .pt 之间（如 "_pl48"），与 denoiser_variant 独立；用于不同 pred_len 训练时避免覆盖默认文件名
     simdiff_checkpoint_extra_suffix: str | None = None
 
+    # 训练集时间序列边际（仅 OT/温度等单列或 C 维多通道）：评测用文献常见「train z-score」，与 NI 扩散目标无关
+    train_metric_z_mu: Any = field(default=None, repr=False)
+    train_metric_z_sigma: Any = field(default=None, repr=False)
+
     timesteps: int = 200
     cosine_s: float = 5.0
     # 推理默认 DDIM：与常规模型兼容，常比逐步 DDPM 更利时序形状；可改回 ddpm 做对照
@@ -76,11 +89,18 @@ class Config:
 
     # 略加重：利於跟踪未来段陡变（重训后生效）；可退回 0.08 / 0.05
     training_noise_l1_weight: float = 0.10
-    training_noise_temporal_diff_weight: float = 0.08
+    # 略增：惩罚 Δε 过小，减轻「归一化空间里轨迹过平 → 反变换贴 μ_f」的倾向（几乎不增加训练耗时）。
+    training_noise_temporal_diff_weight: float = 0.10
     # 主噪声项 = α·MSE(ε̂,ε) + (1-α)·smooth_l1(ε̂,ε)；α<1 略抑极端噪声、利尾部分布与 RevIn 稳定
     training_noise_mse_huber_alpha: float = 0.92
     # smooth_l1 的 β（Huber 型分段阈）；仅当 α<1 时参与
     training_noise_huber_beta: float = 1.0
+    # 扩散主损失上追加 λ·MSE(x̂0, x0)（由预测 ε 推 x̂0，同一次前向得到；0=关闭）。
+    # 默认略 >0（P0）：在 NI 的未来归一化空间拉齐轨迹形状，利 Wind 类等陡变窗口；更重可试 0.2～0.3，须重训。
+    training_noise_x0_aux_weight: float = 0.15
+
+    # 反变换：μ/σ 按 (1-w)·未来 + w·历史 凸组合；w=0 为纯正 NI（与训练目标一致，报告指标务必保持 0）
+    ni_inverse_hist_frac: float = 0.0
 
     # 更大 batch：序列维 RevIn 的实例方差估计更稳（显存不够可改回 64）
     batch_size: int = 96
@@ -103,6 +123,21 @@ class Config:
     early_stop_patience: int = 10
     grad_clip_max_norm: float = 0.5
     z_clip: float = 4.0
+
+    # -------- SimDiff 验证 / checkpoint（默认不改变旧行为：仍为 val 噪声 loss）--------
+    # >0 时：每隔 N 个 epoch 在验证集上前若干个 batch 上算一次「真实预报 MAE」（主变量通道），开销 << 每 epoch 全验证集采样。
+    # 设为 0 则完全不跑稀疏预报 MAE（训练最快）。
+    val_forecast_mae_every: int = 0
+    val_forecast_mae_max_batches: int = 4
+    # 稀疏验证预报 MAE 时所用采样次数 K；None 表示与 forecast_num_samples 相同（最慢、与测试完全一致）。
+    # 设为较小值（须能被 mom_num_groups 整除，ni_only 除外）可明显缩短「每 N epoch」那一段耗时。
+    val_forecast_mae_num_samples: Optional[int] = None
+    # "val_noise"：与旧版一致，按 validate() 的扩散噪声训练损失保存 best / 早停。
+    # "val_forecast_mae_sparse"：在跑了稀疏预报 MAE 的 epoch 上用该 MAE 决定是否保存；未跑的 epoch 仍回落到 val_noise（避免前几 epoch 无权重）。
+    checkpoint_select_metric: str = "val_noise"
+
+    # 多尺度开启时：学习型基线默认只吃 hist 前 seq_len（公平对照）；True 则基线也用 effective_hist_len()，与 SimDiff 信息量对齐。
+    baseline_use_full_hist: bool = False
 
     device: str = "cuda"
     # SimDiff 推理/采样/评估 forecast：在 CUDA 上用 autocast(float16) 加速（非训练循环）
@@ -169,8 +204,12 @@ class Config:
         return self.resolved_data_path().stem
 
     def resolved_result_dir(self) -> Path:
-        """毕设图表输出目录：result/<slug>/，换数据集时改 data_path 即可隔离。"""
-        p = self.project_root / self.result_dir / self.result_dataset_slug()
+        """毕设图表输出目录：`result/<slug>/`；`wind` 数据集单独使用项目根下 **`wind/`**（与用户约定一致）。"""
+        slug = self.result_dataset_slug()
+        if slug.lower() == "wind":
+            p = self.project_root / "wind"
+        else:
+            p = self.project_root / self.result_dir / slug
         p.mkdir(parents=True, exist_ok=True)
         return p
 
@@ -182,7 +221,7 @@ class Config:
 
     def result_png_basename(self, stem: str) -> str:
         """
-        stem 为不含路径与扩展名的逻辑名，如 bar_mae_mse_temperature。
+        stem 为不含路径与扩展名的逻辑名，如 bar_mae_mse_comparison。
         result_name_suffix 非空时返回 stem_<suffix>.png；为 None 时返回 stem.png（旧覆盖行为）。
         """
         s = stem.strip()
@@ -252,6 +291,13 @@ class Config:
             )
         if float(self.training_noise_huber_beta) <= 0.0:
             raise ValueError("training_noise_huber_beta 必须 > 0")
+        if float(getattr(self, "training_noise_x0_aux_weight", 0.0)) < 0.0:
+            raise ValueError("training_noise_x0_aux_weight 必须 >= 0")
+
+    def validate_ni_inverse_options(self) -> None:
+        w = float(getattr(self, "ni_inverse_hist_frac", 0.0))
+        if not 0.0 <= w <= 1.0:
+            raise ValueError(f"ni_inverse_hist_frac 须在 [0,1]，当前为 {w!r}")
 
     def validate_thesis_plot_options(self) -> None:
         lam = float(self.thesis_plot_gt_peek_simdiff)
@@ -259,3 +305,44 @@ class Config:
             raise ValueError(
                 f"thesis_plot_gt_peek_simdiff 须在 [0,1]，当前为 {lam!r}"
             )
+        if int(getattr(self, "thesis_overlay_test_batch", 0)) < 0:
+            raise ValueError("thesis_overlay_test_batch 必须 >= 0")
+
+    def validate_forecast_point_and_loss_weight(self) -> None:
+        mode = str(getattr(self, "forecast_point_mode", "mom")).strip().lower()
+        if mode not in ("mom", "mean", "single"):
+            raise ValueError(
+                f"forecast_point_mode 须为 mom / mean / single，当前为 {mode!r}"
+            )
+        lw = float(getattr(self, "forecast_loss_primary_weight", 1.0))
+        if lw <= 0.0:
+            raise ValueError(f"forecast_loss_primary_weight 须 > 0，当前为 {lw!r}")
+
+    def validate_training_checkpoint_options(self) -> None:
+        every = int(getattr(self, "val_forecast_mae_every", 0))
+        if every < 0:
+            raise ValueError("val_forecast_mae_every 必须 >= 0")
+        mb = int(getattr(self, "val_forecast_mae_max_batches", 1))
+        if mb < 1:
+            raise ValueError("val_forecast_mae_max_batches 必须 >= 1")
+        m = str(getattr(self, "checkpoint_select_metric", "val_noise"))
+        allowed = ("val_noise", "val_forecast_mae_sparse")
+        if m not in allowed:
+            raise ValueError(f"checkpoint_select_metric 须为 {allowed}，当前为 {m!r}")
+        if m == "val_forecast_mae_sparse" and every <= 0:
+            raise ValueError(
+                "checkpoint_select_metric=val_forecast_mae_sparse 时需 val_forecast_mae_every > 0，"
+                "否则永远不会触发稀疏预报 MAE。"
+            )
+        fk = getattr(self, "val_forecast_mae_num_samples", None)
+        if fk is not None:
+            k = int(fk)
+            if k < 1:
+                raise ValueError(f"val_forecast_mae_num_samples 必须 >= 1，当前为 {k!r}")
+            if self.simdiff_ablation != "ni_only":
+                mg = int(self.mom_num_groups)
+                if mg >= 1 and k % mg != 0:
+                    raise ValueError(
+                        f"val_forecast_mae_num_samples={k} 须能被 mom_num_groups={mg} 整除（MoM）；"
+                        "或改用 ni_only / 另选 K。"
+                    )

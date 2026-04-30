@@ -1,0 +1,16 @@
+Wind 权重第一步检查结果（根据 net.in_proj.weight 形状推断通道数）
+生成方式：在项目根运行 wind_experiments/inspect_wind_ckpt.py
+
+=== simdiff_weather_best_wind.pt ===
+meta.input_dim: None（旧 checkpoint 未写入，属正常）
+meta.temperature_only: None
+net.in_proj.weight shape=(192, 1) → 推断 C = 1（单变量）
+
+=== simdiff_weather_best_wind_mv.pt ===
+meta.input_dim: None
+meta.temperature_only: None
+net.in_proj.weight shape=(192, 7) → 推断 C = 7（多变量，与 wind.csv 七列数值特征一致）
+
+结论：
+- 单变量评估须：--data_path data/wind.csv，且不加 --all_features，权重须为 C=1（可用默认后缀得到 simdiff_weather_best_wind.pt，或专用后缀见 NEXT_STEPS.txt）。
+- 多变量评估须：--all_features，权重须为 C=7（例如 simdiff_weather_best_wind_mv.pt），二者不可混加载。

@@ -71,6 +71,17 @@ def _extract(a: torch.Tensor, t: torch.Tensor, x_shape: tuple[int, ...]) -> torc
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
+def _channel_weighted_mean(
+    diff: torch.Tensor, channel_weights: torch.Tensor | None
+) -> torch.Tensor:
+    """diff 末维为通道 C，与 x0 同形 (B,L,C)；channel_weights (C,)。"""
+    if channel_weights is None:
+        return diff.mean()
+    wsum = channel_weights.sum().clamp(min=1e-8)
+    w = channel_weights.view(1, 1, -1).to(dtype=diff.dtype, device=diff.device)
+    return (diff * w).sum() / (diff.shape[0] * diff.shape[1] * wsum)
+
+
 class GaussianDiffusion(nn.Module):
     def __init__(self, timesteps: int, cosine_s: float = 5.0):
         super().__init__()
@@ -107,27 +118,41 @@ class GaussianDiffusion(nn.Module):
         temporal_diff_weight: float = 0.0,
         mse_huber_alpha: float = 1.0,
         huber_beta: float = 1.0,
+        x0_aux_weight: float = 0.0,
+        channel_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         noise = torch.randn_like(x0)
         x_t = self.q_sample(x0, t, noise)
         pred = model(x_t, t, hist)
         a = float(mse_huber_alpha)
         b = float(huber_beta)
+        cw = channel_weights
         if a >= 1.0 - 1e-8:
-            main = F.mse_loss(pred, noise)
+            main = _channel_weighted_mean((pred - noise) ** 2, cw)
         elif a <= 1e-8:
-            main = F.smooth_l1_loss(pred, noise, beta=b)
+            sl = F.smooth_l1_loss(pred, noise, beta=b, reduction="none")
+            main = _channel_weighted_mean(sl, cw)
         else:
-            main = a * F.mse_loss(pred, noise) + (1.0 - a) * F.smooth_l1_loss(
-                pred, noise, beta=b
+            e2 = (pred - noise) ** 2
+            sl = F.smooth_l1_loss(pred, noise, beta=b, reduction="none")
+            main = a * _channel_weighted_mean(e2, cw) + (1.0 - a) * _channel_weighted_mean(
+                sl, cw
             )
         loss = main
+        w0 = float(x0_aux_weight)
+        if w0 > 0.0:
+            sqrt_ab = _extract(self.sqrt_alphas_cumprod, t, x0.shape)
+            sqrt_1mab = _extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape)
+            pred_x0 = (x_t - sqrt_1mab * pred) / sqrt_ab.clamp(min=1e-8)
+            loss = loss + w0 * _channel_weighted_mean((pred_x0 - x0) ** 2, cw)
         if l1_weight > 0:
-            loss = loss + l1_weight * F.l1_loss(pred, noise)
+            loss = loss + l1_weight * _channel_weighted_mean(
+                (pred - noise).abs(), cw
+            )
         if temporal_diff_weight > 0 and x0.shape[1] >= 2:
             pd = pred[:, 1:] - pred[:, :-1]
             nd = noise[:, 1:] - noise[:, :-1]
-            loss = loss + temporal_diff_weight * F.mse_loss(pd, nd)
+            loss = loss + temporal_diff_weight * _channel_weighted_mean((pd - nd) ** 2, cw)
         return loss
 
     @torch.no_grad()

@@ -1,5 +1,5 @@
 """
-训练 / 验证循环、早停、学习率衰减与最优权重保存。
+训练 / 验证循环、早停与最优权重保存；**固定学习率**（无调度器）。
 支持训练期 CUDA 混合精度（AMP）与 SimDiff 权重的 EMA（验证与保存/推理用）。
 """
 from __future__ import annotations
@@ -11,11 +11,11 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
 from config.config import Config
-from models.simdiff import SimDiffWeather
+from models.simdiff import SimDiffWeather, point_prediction_from_forecast
+from utils.baselines import forecast_amp_context
 
 
 def _config_to_meta(cfg: Config) -> dict:
@@ -32,6 +32,10 @@ def _config_to_meta(cfg: Config) -> dict:
         "training_noise_temporal_diff_weight": cfg.training_noise_temporal_diff_weight,
         "training_noise_mse_huber_alpha": cfg.training_noise_mse_huber_alpha,
         "training_noise_huber_beta": cfg.training_noise_huber_beta,
+        "training_noise_x0_aux_weight": float(
+            getattr(cfg, "training_noise_x0_aux_weight", 0.0)
+        ),
+        "ni_inverse_hist_frac": float(getattr(cfg, "ni_inverse_hist_frac", 0.0)),
         "forecast_num_samples": cfg.forecast_num_samples,
         "mom_num_groups": cfg.mom_num_groups,
         "mom_cold_bias_blend": cfg.mom_cold_bias_blend,
@@ -60,15 +64,26 @@ def _config_to_meta(cfg: Config) -> dict:
         "train_amp": cfg.train_amp,
         "use_ema": cfg.use_ema,
         "ema_decay": cfg.ema_decay,
+        "val_forecast_mae_every": int(getattr(cfg, "val_forecast_mae_every", 0)),
+        "val_forecast_mae_max_batches": int(getattr(cfg, "val_forecast_mae_max_batches", 4)),
+        "val_forecast_mae_num_samples": getattr(cfg, "val_forecast_mae_num_samples", None),
+        "checkpoint_select_metric": getattr(cfg, "checkpoint_select_metric", "val_noise"),
+        "forecast_point_mode": getattr(cfg, "forecast_point_mode", "mom"),
+        "forecast_loss_primary_weight": float(
+            getattr(cfg, "forecast_loss_primary_weight", 1.0)
+        ),
+        "forecast_loss_primary_channel_idx": getattr(
+            cfg, "forecast_loss_primary_channel_idx", None
+        ),
     }
     if cfg.train_future_marginal_mean is not None:
         meta["train_future_marginal_mean"] = np.asarray(
             cfg.train_future_marginal_mean, dtype=np.float64
         ).tolist()
-    if cfg.train_future_marginal_std is not None:
-        meta["train_future_marginal_std"] = np.asarray(
-            cfg.train_future_marginal_std, dtype=np.float64
-        ).tolist()
+    if getattr(cfg, "train_metric_z_mu", None) is not None:
+        meta["train_metric_z_mu"] = np.asarray(cfg.train_metric_z_mu, dtype=np.float64).tolist()
+    if getattr(cfg, "train_metric_z_sigma", None) is not None:
+        meta["train_metric_z_sigma"] = np.asarray(cfg.train_metric_z_sigma, dtype=np.float64).tolist()
     return meta
 
 
@@ -109,26 +124,23 @@ class Trainer:
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
         device: torch.device,
+        *,
+        primary_forecast_channel: int = 0,
     ):
         self.cfg = cfg
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        self.primary_forecast_channel = int(primary_forecast_channel)
         self.optim = torch.optim.AdamW(
             model.parameters(),
             lr=cfg.learning_rate,
             weight_decay=1e-4,
             betas=(0.9, 0.99),
         )
-        self.scheduler = ReduceLROnPlateau(
-            self.optim,
-            mode="min",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-7,
-        )
         self.best_val = float("inf")
+        self.best_forecast_mae = float("inf")
         self.bad_epochs = 0
         self.history_train: list[float] = []
         self.history_val: list[float] = []
@@ -220,6 +232,39 @@ class Trainer:
             return float("nan")
         return float(np.mean(losses))
 
+    @torch.no_grad()
+    def validation_forecast_mae_sparse(self) -> float:
+        """
+        验证集上前若干个 batch：主变量通道平均 MAE（与评估一致的 forecast + MoM/ni_only）。
+        仅在稀疏调度下调用；可通过 cfg.val_forecast_mae_num_samples 减小 K 以加速。
+        """
+        ch = self.primary_forecast_channel
+        max_b = int(getattr(self.cfg, "val_forecast_mae_max_batches", 4))
+        k_sparse = getattr(self.cfg, "val_forecast_mae_num_samples", None)
+        sums = 0.0
+        count = 0
+        with self._param_snapshot():
+            self.model.eval()
+            with forecast_amp_context(self.device, bool(self.cfg.forecast_amp)):
+                for bi, (hist, fut) in enumerate(self.val_loader):
+                    if bi >= max_b:
+                        break
+                    hist = hist.to(self.device)
+                    fut = fut.to(self.device)
+                    ks = int(k_sparse) if k_sparse is not None else None
+                    out = self.model.forecast(
+                        hist,
+                        future=fut,
+                        num_samples=ks,
+                    )
+                    pred = point_prediction_from_forecast(out, self.cfg)
+                    diff = torch.abs(pred[..., ch] - fut[..., ch])
+                    sums += float(diff.sum().item())
+                    count += int(diff.numel())
+        if count <= 0:
+            return float("nan")
+        return sums / count
+
     def save(self, path: Path, epoch: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         if self.ema is not None:
@@ -246,24 +291,68 @@ class Trainer:
         print(f"=== 权重将保存为: {best_path.name} (ablation={self.cfg.simdiff_ablation}) ===")
         print(
             f"  train_amp={'on' if self._scaler is not None else 'off'} | "
-            f"ema={'on' if self.ema is not None else 'off'}"
+            f"ema={'on' if self.ema is not None else 'off'} | lr 固定 {self.cfg.learning_rate:.2e}（无调度器）"
+        )
+        metric = str(getattr(self.cfg, "checkpoint_select_metric", "val_noise"))
+        every_fc = int(getattr(self.cfg, "val_forecast_mae_every", 0))
+        max_b_fc = int(getattr(self.cfg, "val_forecast_mae_max_batches", 4))
+        k_fast = getattr(self.cfg, "val_forecast_mae_num_samples", None)
+        _k_note = ""
+        if every_fc > 0 and k_fast is not None:
+            _k_note = f"，验证采样 K={int(k_fast)}（快于完整测试 K={cfg.forecast_num_samples}）"
+        print(
+            f"  checkpoint 依据: {metric}"
+            + (
+                f" | 稀疏预报 MAE: 每 {every_fc} epoch，≤{max_b_fc} val batches（主变量 ch={self.primary_forecast_channel}{_k_note}）"
+                if every_fc > 0
+                else ""
+            )
         )
 
         for epoch in range(1, self.cfg.epochs + 1):
             tr = self.train_epoch()
             va = self.validate()
-            self.scheduler.step(va)
             lr_now = self.optim.param_groups[0]["lr"]
-            print(
-                f"Epoch {epoch:03d} | train_loss {tr:.6f} | val_mse {va:.6f} | lr {lr_now:.2e}"
+
+            run_fc = every_fc > 0 and (epoch % every_fc == 0)
+            fmae: float | None = None
+            if run_fc:
+                fmae = float(self.validation_forecast_mae_sparse())
+
+            msg = (
+                f"Epoch {epoch:03d} | train_loss {tr:.6f} | val_noise {va:.6f} | lr {lr_now:.2e}"
             )
+            _kf_sparse = getattr(self.cfg, "val_forecast_mae_num_samples", None)
+            if fmae is not None and np.isfinite(fmae):
+                _kpart = f", K={int(_kf_sparse)}" if _kf_sparse is not None else ""
+                msg += (
+                    f" | val_fc_MAE[ch{self.primary_forecast_channel}] {fmae:.6f} "
+                    f"(sparse ≤{max_b_fc} batches{_kpart})"
+                )
+            print(msg)
+
             self.history_train.append(tr)
             self.history_val.append(float(va) if np.isfinite(va) else float("nan"))
             if not np.isfinite(va):
                 print("  [warn] val 非有限，请检查数据。")
                 continue
-            if va < self.best_val - 1e-8:
-                self.best_val = va
+
+            improved = False
+            if metric == "val_noise":
+                if va < self.best_val - 1e-8:
+                    self.best_val = va
+                    improved = True
+            else:
+                # val_forecast_mae_sparse：有稀疏 MAE 的 epoch 优先按预报改进存盘；否则按噪声 loss（前几 epoch 热身）
+                if fmae is not None and np.isfinite(fmae):
+                    if fmae < self.best_forecast_mae - 1e-8:
+                        self.best_forecast_mae = fmae
+                        improved = True
+                elif va < self.best_val - 1e-8:
+                    self.best_val = va
+                    improved = True
+
+            if improved:
                 self.bad_epochs = 0
                 self.save(best_path, epoch)
                 print(f"  -> saved best to {best_path}")

@@ -1,0 +1,57 @@
+以下均在项目根 Simdiff_weather 下执行：cd /path/to/Simdiff_weather
+
+【第三步】单变量：训练 → 评估 → 图写入 wind_experiments/univariate/
+  建议使用专用后缀 _wind_uni，避免与旧文件 simdiff_weather_best_wind.pt 混淆。
+
+  训练：
+    python3 main.py --data_path data/wind.csv \
+      --ckpt_extra_suffix _wind_uni \
+      --figures_dir wind_experiments/univariate \
+      --epochs 50
+
+  仅评估（已有 checkpoints/simdiff_weather_best_wind_uni.pt）：
+    python3 main.py --data_path data/wind.csv \
+      --ckpt_extra_suffix _wind_uni \
+      --figures_dir wind_experiments/univariate \
+      --eval_only
+
+  终端需出现：特征维度 C=1，列仅为 OT（或与单列设定一致）。
+
+【第四步】多变量：训练 → 评估 → 图写入 wind_experiments/multivariate/
+
+  （P0）未写 --ckpt_extra_suffix 时，main 对 wind + --all_features 已默认 simdiff_weather_best_wind_mv.pt，
+  与单变量默认 _wind 分离；仍可用显式后缀覆盖。
+
+  训练：
+    python3 main.py --data_path data/wind.csv \
+      --all_features \
+      --figures_dir wind_experiments/multivariate \
+      --epochs 50
+
+  仅评估（已有 checkpoints/simdiff_weather_best_wind_mv.pt）：
+    python3 main.py --data_path data/wind.csv \
+      --all_features \
+      --figures_dir wind_experiments/multivariate \
+      --eval_only
+
+  终端需出现：特征维度 C=7（wind.csv 数值列）。
+
+【第五步】对比效果（不要只看一张 overlay）
+  两次 eval_only 后对比终端表里 OT 的测试 MAE/MSE（全测试集）。
+  可选跳过基线加速：加 --skip_baselines（若只关心 SimDiff）。
+
+【第六步】换 overlay 窗口（可选）
+    python3 main.py --data_path data/wind.csv \
+      --all_features \
+      --figures_dir wind_experiments/multivariate \
+      --eval_only \
+      --thesis_overlay_test_batch 3
+
+  或多个 batch：... --eval_only --thesis_overlay_batches 0,5,40
+  仅 batch 40 且写入项目根 **`wind/`**（勿加 --figures_dir，wind 数据集默认即为 `wind/`）：
+    python3 main.py --data_path data/wind.csv --all_features --single_scale_hist \
+      --eval_only --forecast_point mean --thesis_overlay_batches 40
+  非 `--forecast_point mom` 时 overlay 文件名会多 `_fpmean` / `_fpsingle`，避免与默认叠图误判为「没区别」。
+
+复测权重通道数：
+    python3 wind_experiments/inspect_wind_ckpt.py simdiff_weather_best_wind_uni.pt simdiff_weather_best_wind_mv.pt

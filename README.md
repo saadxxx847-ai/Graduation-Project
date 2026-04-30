@@ -171,7 +171,7 @@ python main.py --eval_only
    测试脚本中会额外对 **一个 batch** 做完整采样并报告原始尺度 MSE/MAE（**需训练充分**；MAE 为 21 维特征混合平均，不等价于「温度误差几度」）。
 
 5. **训练稳定性（`utils/trainer.py` + `config`）**  
-   学习率默认 **5e-5**，**梯度裁剪** `grad_clip_max_norm=0.5`，**ReduceLROnPlateau** 在验证不降时减半学习率；跳过非有限 `loss` 的 batch；checkpoint 内保存 `meta`（含 `global_mean/std` 等）便于追溯。
+   学习率默认 **3e-4**（见 `Config.learning_rate`），**全程不变**（**无** `ReduceLROnPlateau`）；**梯度裁剪** `grad_clip_max_norm=0.5`；跳过非有限 `loss` 的 batch；checkpoint 内保存 `meta`（含 `train_future_marginal` 等）便于追溯。
 
 ---
 

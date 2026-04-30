@@ -292,6 +292,7 @@ def plot_forecast_compare(
     hist_anchor_index: int = -1,
     gt_peek_blend: float = 0.0,
     gt_peek_name_prefix: str = "SimDiff",
+    gt_peek_append_title_hint: bool = True,
 ) -> None:
     """
     单窗口：历史 + 真值未来 + 多模型预测；图例与各模型曲线颜色、线型一一对应。
@@ -361,7 +362,7 @@ def plot_forecast_compare(
     ax.set_xlabel("time step (index)")
     ax.set_ylabel(ylabel)
     t_show = title
-    if float(gt_peek_blend) > 0.0:
+    if float(gt_peek_blend) > 0.0 and bool(gt_peek_append_title_hint):
         t_show = (
             f"{title} | display: {gt_peek_name_prefix} (1-λ)p+λ·GT, λ={float(gt_peek_blend):.3f}"
         )

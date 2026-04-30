@@ -1,0 +1,3 @@
+此目录用于「单变量 Wind」实验产出。
+训练或评估时请加：--figures_dir wind_experiments/univariate
+图表（柱状图、forecast overlay 等）会写到本文件夹，而不覆盖 wind/ 下其它实验。

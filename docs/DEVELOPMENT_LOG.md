@@ -1184,3 +1184,496 @@ python main.py --data_path data/ETTm1.csv --figures_dir ETTm1 \
 - 若需原始尺度意义上的「好权重」，可调 `epochs` / `learning_rate` / 模型宽度，或以 **`--eval_only` 在若干 checkpoint 上扫测试 MAE**（不塞进每个 epoch 的 validate）。
 
 ---
+
+## 2026-04-30：`data/wind.csv` 上 OT 预测、15min 多尺度、`result/` 文件名与英文图表
+
+### 数据
+
+- **`data/wind.csv`**：含 **`OT`** 列；时间步为 **15 分钟**。多尺度池化与 ETTm 相同，须要 **`steps_per_hour=4`**。
+
+### 代码
+
+| 文件 | 说明 |
+|------|------|
+| `utils/data_loader.py` | `resolve_multiscale_steps_per_hour`：`wind` stem 返回 **4**；`resolve_temperature_column_name` 已由 **OT** 分支选中目标列。 |
+| `main.py` | **`wind.csv`** 且未指定 **`--ckpt_extra_suffix`** 时自动 **`_wind`** → **`simdiff_weather_best_wind.pt`**，避免与 **`weather`** 共用默认 checkpoint。CLI 显式后缀优先。 |
+| `main.py` | 毕设图逻辑名：**`bar_mae_mse_comparison`**、**`forecast_curves_overlay`**（接替原 `*_temperature*`）；图题与柱状图 **`ylabel` 英文**；`print_thesis_metrics_table(..., english=True)`。 |
+
+### 训练与评估（摘录）
+
+```bash
+cd Simdiff_weather
+python main.py --data_path data/wind.csv
+python main.py --data_path data/wind.csv --eval_only
+```
+
+- 不加 **`--all_features`**（保持仅 **OT** 单变量）。
+- 产出在项目根 **`wind/`**（`--data_path data/wind.csv` 时 **`Config.resolved_result_dir()`** → `Simdiff_weather/wind/`，与 `result/<其它数据集>/` 区分）；终端指标表：**MAE / MSE / CRPS / VAR**；仍可用 **`--figures_dir <子路径>`** 覆盖。
+- **展示名称**：对内仍为多尺度历史 + RMSNorm 等栈；图上与表中统一称 **SimDiff**。
+
+### 兼容性
+
+- 历史文档里的 **`bar_mae_mse_temperature*.png`** 等与当前 **`bar_mae_mse_comparison*.png`**、**`forecast_curves_overlay*.png`** 为同一流水线不同文件名。
+- **目录约定（更新）**：`data_path` stem 为 **`wind`** 时，毕设图默认目录为 **项目根下 `wind/`**（不再是 `result/wind/`）；其它数据集仍为 **`result/<stem>/`**。需要自定义位置时用 **`--figures_dir`**。
+
+## 2026-04-30：`bug/3.txt`「hist 归一 future」vs 本文实现；**train z-score 文献指标**（不拖慢训练）
+
+### 结论（与 `models/simdiff.py` / NI 文档一致）
+
+- **未采纳** `bug/3.txt` 将 **`normalize_future`** 改为完全用 **hist 的 μ/σ** 的做法：那会 **改变 SimDiff NI 的训练目标与论文式表述**，与本仓库 **窗口级未来独立归一化** 不一致；与 `DEVELOPMENT_LOG` 中 NI 条目结论相同。
+- **训练速度**：不重写 `training_loss`，不增加每 epoch 全流程采样早停；**零额外前向**——z 指标在已有 `evaluate_test_loader_prob_combined` 循环内用 **`/σ_train`** 与张量变换完成。
+
+### 实现
+
+| 文件 | 说明 |
+|------|------|
+| `utils/data_loader.py` | 仅用 **训练划分** 整条时间序列估计每通道 **μ、σ**（带 floor），写入 **`cfg.train_metric_z_mu/sigma`**（**不含 val/test**）。 |
+| `main.py` | `evaluate_test_loader_prob_combined` 返回 **`mae_ch_z`、…、`crps_mean_z`**；**毕设横幅表** **`print_thesis_metrics_table`** 与 **`bar_mae_mse_comparison_*`** 以 **MAE_z/MSE_z** 为主；物理尺度副表 **`print_metrics_ascii_table`**、副柱图 **`bar_mae_mse_physical_*`**。**（本条历史）**早期实现曾以物理为主表、`bar_train_z_*` 为副图，见文末 **2026-04-30（续）**。 |
+| `utils/baselines.py` | **`eval_channel_mse_mae_train_zscore`**（点基线同 σ）。 |
+| `config/config.py`、`utils/trainer.py` | 配置字段；checkpoint **meta** 可选记录 z 统计量。 |
+
+### 指标定义
+
+- **`MSE_z`、`MAE_z`**：**\((\hat y - y)^2 / \sigma_{\text{train}}^2\)**、**\(\|\hat y - y\| / \sigma_{\text{train}}\)** 在测试集平均；与「两列先减再除 σ」在差分上等价于 **μ_train 抵消**。  
+- **SimDiff 的 CRPS/VAR（z）**：在 **primary channel** 对样本与观测做 **\((\cdot - \mu_{\text{train}}) / \sigma_{\text{train}}\)** 后重算（与物理尺度 CRPS 并行报告）。
+
+---
+
+## 2026-04-30：Wind 陡变 / NI 与训练目标错位——x0 辅助损失、可选 μ/σ 混合反变换、稀疏 forecast MAE 选优
+
+### 背景
+
+- `debug/1.txt`：`wind` 单变量上 overlay 易出现近似均值回归、难以跟随真值陡降；根因含「归一化空间太平滑」与「早停指标与物理 MAE 不一致」等。
+- 此前日志曾写明「全量每 epoch 用 forecast MAE 早停过慢故移除」；本轮改为**可选项**：仅每 **N** 个 epoch 且在验证集**前 B 个 batch** 上算 forecast MAE 存 best，控制 wall time。
+
+### 代码
+
+| 文件 | 说明 |
+|------|------|
+| `config/config.py` | `training_noise_x0_aux_weight`（默认 0）；`ni_inverse_hist_frac`（默认 0）。校验：`validate_ni_inverse_options`。 |
+| `models/diffusion.py` | `training_losses(..., x0_aux_weight)`：在已有 ε 预测上追加 **λ·MSE(x̂0, x0)**，无额外前向。 |
+| `models/simdiff.py` | `training_loss` 传入 x0 权重；`_future_mu_sig_for_inverse(hist, future, ...)` 支持 **(1-w)·未来统计 + w·历史统计**（`mom_only` 仍仅用 μ_h,σ_h）。 |
+| `utils/trainer.py` | **已移除** `val_forecast_mae_every` 稀疏 forecast 验证与 **`ReduceLROnPlateau`**；早停仍按 **验证噪声 loss**，**学习率全程为 `Config.learning_rate`**。 |
+| `main.py` | CLI：`--x0_aux_weight`、`--ni_inverse_hist_frac`（**无** `--val_forecast_mae_every` / `--val_forecast_max_batches`）。 |
+
+### 论文 / 指标一致性
+
+- **正式对比 SimDiff（NI）**：评测须 **`--ni_inverse_hist_frac 0`**（默认即 0）。`w>0` 仅作工程试探或开环观感，**不是**严格 NI。
+- **`x0_aux_weight`**：仍在 **normalize_future** 空间拟合 x0，与 NI 训练语义一致。
+
+### Wind 推荐训练命令（在可接受耗时下尽量对齐曲线）
+
+```bash
+cd /path/to/Simdiff_weather
+# 删除旧 best 后再训，避免加载过时权重
+rm -f checkpoints/simdiff_weather_best_wind.pt
+
+python main.py --data_path data/wind.csv \
+  --x0_aux_weight 0.12 \
+  --epochs 50
+```
+
+- 若曲线仍偏平滑：可试略增 **`--training_noise_temporal_diff_weight`**（需在代码里暂改 Config 或后续加 CLI）、或 **`--ddim_eta 0.15`**（推理随机性，不重训也可试）。
+- 仅刷新 overlay、**不重训**且愿牺牲 NI 可解释性：可用 **`--ni_inverse_hist_frac 0.2`** 与 `--eval_only` 看形态（**勿**与论文表 MAE 混报）。
+- 产出目录：默认 **`wind/`**（或 `--figures_dir result/wind` 自定）。
+
+### 评估出图
+
+```bash
+python main.py --data_path data/wind.csv --eval_only --ni_inverse_hist_frac 0
+```
+
+---
+
+### （更新）已撤回的慢速验证
+
+- **`validate_forecast_mae` / `val_forecast_mae_every`**：因训练过慢已从 **`utils/trainer.py`** 与 **Config/CLI** 删除；checkpoint 仍按 **验证集噪声损失** 选优。
+- **学习率**：SimDiff 训练 **不再使用 `ReduceLROnPlateau`**，全程 **`learning_rate`（默认 3e-4）** 静态，除非你在代码里改 `AdamW` 初始 lr。
+
+---
+
+## 2026-04-30：毕设 `forecast_curves_overlay` 可选测试 batch（`--thesis_overlay_test_batch`）
+
+- **动机**：overlay 原先固定 **test_loader 第 0 个 batch**；全集 MAE 变好时该窗可能仍「看起来像旧图」。
+- **用法**：`--thesis_overlay_test_batch J`（`J` 从 0 起）。**只改** overlay 画的窗口，**不改**表内全测试集指标；`J` 超范围时告警并退回 0。
+- **实现**：`main.thesis_overlay_fetch_batch`；`Config.thesis_overlay_test_batch`。
+
+---
+
+## 2026-04-30：多尺度 vs 单尺度——`train_loss` 起始数值为何从几百 vs 约 0.4（问与答）
+
+### 现象
+
+- **多尺度历史**（默认 `use_multiscale_hist=True`）训练初期：终端 `train_loss`（及 `val_mse` / `val_noise`）常出现 **几十～数百或更高**，随后若干 epoch 内快速下降。
+- **单尺度历史**（`--single_scale_hist`，如 `checkpoints/simdiff_weather_best_wind_noms.pt` 一类实验）：第一轮 `train_loss` 即可在 **约 0.3～1.x** 量级。
+
+### 解答（非两套损失、非 bug）
+
+1. **`train_loss` 定义相同**：均为 `models/simdiff.py` 的 `training_loss` → 在 **`normalize_future(future)`** 得到的 **`fut_n`（NI 未来 z-score 空间）** 上做扩散噪声目标（`GaussianDiffusion.training_losses`：MSE/Huber、可选 L1、时间差分、可选 x0 辅助）；**不是** CSV 物理风速尺度。
+2. **单尺度**：`hist` 仅 **seq_len** 步、分辨率一致；`normalize_history(..., hist_stats_span=seq_len)` 与整段历史语义一致，**条件 `hist_n` 更齐**，冷启动时 **ε̂** 误差往往就是 **O(1)** 量级 → **loss 一上来就小** 很正常。
+3. **多尺度**：`hist` 为 **细粒度段 + 日/周池化尾段**；μ_h、σ_h 仍只由 **前 seq_len 步** 估计，再仿射到 **含池化 token 的整段**。尾段与参照段尺度混杂，**条件分布更难**，随机初始化下 **ε 预测可差很多** → **初始 `train_loss` 可大若干数量级**，随后优化变顺，与日志一致。
+4. **与旧日志中 `val_forecast_mae`、学习率调度**：仅影响选 checkpoint / lr，**不改变 `train_loss` 定义**；当前仓库已改为 **静态 lr** 且已移除稀疏 forecast 验证（见上节）。
+
+### 使用建议
+
+- **不要**用首轮 `train_loss` 绝对值横向对比「多尺度 run vs 单尺度 run」判断谁更对；应看 **收敛趋势、验证/测试噪声 loss 与最终 MAE/MSE**。
+
+---
+
+## 2026-04-30：关多尺度后 overlay 上 **ground truth 也变了**？（问与答）
+
+### 问题
+
+两张国别为「多尺度 / 单尺度」的 `forecast_curves_overlay`，均称 **test batch 0**，但 **黑色真值折线不同**——真值不应该是固定的吗？
+
+### 解答
+
+- **「batch 0」固定的是 DataLoader 里第 0 个 batch**，不是「固定在同一日历时刻」。
+- **`utils/data_loader.make_loaders`**：仅当 **`use_multiscale_hist=True`** 时会把 **`hist_window_start_min`** 抬到 `multiscale_window_start_min(seq_len, steps_per_hour)`（Wind 15min 下为 **2592**，见 `multiscale_steps_per_hour`）。
+- **`WeatherWindowDataset.__getitem__`**：`i = idx + window_start_min`。  
+  - **多尺度**：`idx=0` → `i=2592`（在 **test 段**矩阵内），未来窗 = `data[2592+seq_len : …]`。  
+  - **单尺度**：`window_start_min` 常为 **0**（未进入多尺度分支则不改写），`idx=0` → `i=0`，未来窗 = `data[seq_len : seq_len+pred_len]`。
+- 因此 **同一「数据集第 0 号样本」对应的全局时间完全不是同一窗**，**ground truth（黑色）必然可不同**。不是画图 bug，也不是 NI 反变换偷换了标签。
+
+### 若要「同一日历窗」对比多尺度 vs 单尺度
+
+需在两种设定下对齐 **`WeatherWindowDataset` 的窗口起点 `i`**（例如单尺度也在 `Config` / `make_loaders` 里使用与多尺度相同的 **`hist_window_start_min`**，使 `idx=0` 对应同一段 `fut`）。当前 **`main.py` 无**专门 CLI；可自行改 `Config.hist_window_start_min` 或写小脚本按固定 `i` 取 `(hist, fut)` 再分别构图。
+
+---
+
+## 2026-04-30（晚间）：撤回按 `debug/1.txt` 实施的全套训练/数据改动
+
+因线下实验 **效果变差**，已**代码级还原**此前条目「Wind 数据集预测完整修复（`debug/1.txt` 优先级 1–5）」中的行为，恢复为：
+
+- **`utils/data_loader.py`**：仅 **多尺度** 时抬 **`hist_window_start_min`**（与本条上文「GT 为何不同」的说明再度一致）。
+- **`models/simdiff.py`**：**`normalize_future`** 作为 **`full`/`ni_only`** 的扩散目标；有真值反变换 **`μ_f,σ_f`**（与旧 NI 表述一致）。
+- **`models/diffusion.py`**：训练损失 **无** 陡变样本 **`tanh` 权重**。
+- **`config/config.py`**：**`training_noise_x0_aux_weight=0`**、**`ddim_eta=0`**、**`sampling_steps=None`**（与其它历史默认一致）。
+- **`main.py`**：`--ni_inverse_hist_frac` / `--x0_aux_weight` 帮助文案恢复为改动前表述。
+
+下方 **「Wind 数据集预测完整修复」** 整节保留作**归档**；当前仓库行为 **以本节「撤回」为准**。
+
+---
+
+## 2026-04-30：Wind 数据集预测完整修复（`debug/1.txt` 优先级 1–5）【已撤回，仅存档】
+
+依据 `debug/1.txt` 的讨论稿，将 **测试集对齐、训练–推理归一化一致、默认扩散与采样超参、陡变加权损失** 一并落地；**须删旧 checkpoint 重训** 后才有意义（归一化目标与损失形状已变）。
+
+### 优先级 1：单尺度 / 多尺度共用 `hist_window_start_min`
+
+| 文件 | 说明 |
+|------|------|
+| `utils/data_loader.py` | 在 **`make_loaders`** 中：**无论**是否多尺度，均 **`cfg.hist_window_start_min = multiscale_window_start_min(seq_len, steps_per_hour)`**，**`window_start_min`** 用该值。保证同一 **`test batch 0`** 的 **`fut` 在时间轴对齐**，对比实验可比。 |
+
+### 优先级 2：训练与评估反变换均以 **历史 μ_h,σ_h** 归一化未来
+
+| 文件 | 说明 |
+|------|------|
+| `models/simdiff.py` | **`training_loss`**：**不再**调用 **`normalize_future(future)`** 作扩散目标；改为 **`fut_n = (future - μ_h) / σ_h.clamp(min=1e-5)`**（与 **`normalize_history(..., hist_stats_span=seq_len)`** 同一统计量）。**`_future_mu_sig_for_inverse`**：有 **`hist`** 时反变换即用 **`μ_h,σ_h`**（与训练一致）；**无真值推理**仍为训练集边际 + 可选 **`ni_inverse_hist_frac`** 混合。**`mom_only`** 与原 hist 路径一致故与主路径合并。 |
+
+**说明**：与原「纯正 NI：`normalize_future` 空间扩散 + 评测用 μ_f/σ_f」表述不同；本版刻意消除「训练时能见 fut 统计量」与开环推理的错位。论文若仍写 NI，需改称 **historical-affined future target** 或单独章节说明设计取舍。
+
+### 优先级 3–4：默认超参（重训 / 不重训）
+
+| 文件 | 配置项（新默认） |
+|------|------------------|
+| `config/config.py` | **`training_noise_x0_aux_weight=0.5`** |
+| `config/config.py` | **`ddim_eta=0.3`**、**`sampling_steps=300`**（DDIM 子步数仍会受 **`timesteps`** 上界约束，参见 `models/diffusion.build_ddim_time_pairs`）。 |
+
+CLI **`--x0_aux_weight`** 仍可覆盖 **`training_noise_x0_aux_weight`**；仅 **`--eval_only`** 可调 **`--ddim_eta` / `--sampling_steps`** 试采样。
+
+### 优先级 5：陡变加权（ε 损失与 x0 辅助同权）
+
+| 文件 | 说明 |
+|------|------|
+| `models/diffusion.py` | **`training_losses(..., steep_hist_span=None)`**：用 **`hist[:, :span]`** 与未来 **`x0`** 的全时均值之差构造 **`tanh`** 缩放权重 **[1,5]**，对 **主 Huber/MSE（逐元素加权再平均）** 与 **加权 x0_aux** 生效。 |
+| `models/simdiff.py` | 传入 **`steep_hist_span=seq_len`**（多尺度时仅用细粒度前缀参与「突变」量级，与日/周池化尾均值脱钩）。 |
+
+### 验证建议
+
+```bash
+# 对齐后：两种模式 test 样本数与 batch 0 的真值窗口一致（须同数据与同划分）
+python main.py --data_path data/wind.csv --eval_only --skip_baselines
+python main.py --data_path data/wind.csv --eval_only --skip_baselines --single_scale_hist
+
+# 不重训先试采样默认值或 CLI
+python main.py --data_path data/wind.csv --eval_only --ddim_eta 0.3 --sampling_steps 300
+```
+
+### 与上文日志条目关系（存档）
+
+- 此节描述 **已撤回** 的代码状态；**当前仓库**以本节之上 **「2026-04-30（晚间）：撤回…」** 为准。
+- 历史争论（`bug/3.txt` 等）仍以各日期条目为准；**勿**将本节当作现行实现。
+
+---
+
+## 2026-04-30：`data/wind.csv` 上 OT 预测曲线差——根因排查与优化优先级（助手排查）
+
+### 数据与目标列
+
+- 默认 **`temperature_only=True`** 时，`resolve_temperature_column_name` 在 `wind.csv` 表头中命中 **`OT`**（第 7 列），与「预测 OT」一致；**不是**误选 `pred_temp`（需列名**精确**等于 `temp` 才会被气温别名命中）。
+- `wind` 为 **15 min** 步长；`resolve_multiscale_steps_per_hour` 对 stem **`wind`** 返回 **4**，多尺度日/周窗与 ETTm 同源逻辑。
+
+### 快速数据侧事实（辅助判断「任务是否不可学」）
+
+- 对 **OT** 全序列 **lag-1 自相关系数约 0.98**（脚本抽检）；**持久化（末值常数外推）** 在典型窗上可得到 **有限 MSE**，说明**仅看单变量自回归**时任务并非白噪声。
+- **多尺度** 下 `hist_window_start_min=2592`（15 min×…），与 **单尺度** 默认 `0` 时 **`WeatherWindowDataset` 第 0 号样本对应的全局时间不同**；若拿「多尺度 overlay」与「单尺度 overlay」对比视觉，**黑色 GT 本就可以不同**（见上文「关多尺度后 GT 也变了」条目），**不是**画法或标签错位。
+
+### SimDiff 曲线「与 GT 无关」的常见机制（代码层）
+
+1. **反变换与弱模型 → 图上像「水平均值」**  
+   评估传 `future` 时，**`full`/`ni_only`** 用本窗 **`normalize_future` 的 μ_f、σ_f**（对 `pred_len` 时间维求均值/标准差，**μ_f 在未来 24 步上为常数偏置**）把归一化空间预测映回物理尺度。若扩散模型在 z 空间输出接近 **0 或缓变**，反变换后轨迹会**贴近该窗真值的时间平均**，与**起伏明显的黑色 GT** 并置时，主观上像「跟真值没关系」。属 **NI + 点预测形态** 与 **拟合不足** 的叠加，不一定是索引 bug。
+
+2. **早停指标 ≠ 预报 MAE**  
+   **`Trainer.validate()`** 仍为 **`training_loss`（扩散噪声项）** 在 z 空间上的均值，**不是** `forecast` 的原始尺度 MAE。可能出现 **val 噪声 loss 已很好但曲线仍扁/偏** 的 checkpoint（日志前文已述）；Wind 多尺度时 **首轮 train_loss 可很大**，更需 **足够 epoch** 或 **事后用测试 MAE 选 ckpt**。
+
+3. **权重与数据必须同配**  
+   `main.py` 对 **`data/wind.csv`** 默认 **`simdiff_checkpoint_extra_suffix="_wind"`** → **`simdiff_weather_best_wind.pt`**。若 **未在 wind 上训练**、**eval_only 加载缺失/错配权重**，或基线 **早停过早**，三条曲线都可以很差。
+
+### 本仓库未改动的结论
+
+- **`bug/3.txt` 式「改只用 μ_h,σ_h 归一化未来」**：与当前 **NI** 训练目标不一致；若未同步改 `training_loss`，会破坏论文表述与实现对应关系（见 **2026-04-29：`bug/3.txt`「NI 泄漏」论断** 条目）。
+
+### 给使用者的「优化建议」——按优先级（高 → 低）
+
+1. **【必做】确认 wind 专用权重与训练充分**：删除或避开 **weather/其它数据集** 的 pt；对 `data/wind.csv` **完整训练**至 `simdiff_weather_best_wind.pt`；基线同样需在 **同一 `make_loaders` 设定** 下训练，避免 **eval_only** 空权重或极早停。
+2. **【高】以「测试集预报 MAE/MSE」选模型，而非只看 val 噪声 loss**：在固定预算下可多训若干 epoch，或对 **已保存的多个 epoch 快照**（若手工另存）做 **`--eval_only` 扫 MAE**；当前默认早停只服务噪声 loss。
+3. **【高】区分「真的差」与「可视化均值回归」**：先看终端 **全测试集 MAE**；若数值尚可但图难看，对照 **z 空间是否过平**；可试 **`training_noise_x0_aux_weight` > 0**（需重训）加强 **x0 形状**、或略增 **`d_model`/`n_layers`/epoch**。
+4. **【中】多尺度 Wind 更难优化**：若优先要「曲线跟上」，可先 **`--single_scale_hist` 训通** 再开多尺度；对比两类设定时 **对齐 `hist_window_start_min`** 再比 overlay（当前无 CLI，需改 `Config` 或自定义取窗脚本）。
+5. **【中】采样与推理**：在**已有权重**上可试 **`--ddim_eta`、`--sampling_steps`**（不改结构）；若疑 **半精度**，可在 `Config` 将 **`forecast_amp=False`** 做对照（工程上优先度低于训练与选优）。
+6. **【中】MoM 平滑**：极端情况下 **MoM/冷尾凸组合** 会略抹平细节；可用 **`--ablation ni_only`**（K 次均值、无中位数）看曲线是否更贴（与 full 共用权重，仅评估路径变）。
+7. **【低】多变量信息**：若业务上允许，**`--all_features`** 用全列作输入、**指标仍看 OT 通道**，有时比单变量 OT 更易拟合（算力与论文叙事成本更高）。
+
+### 涉及文件（排查阅读路径，本次无代码改动）
+
+- `utils/data_loader.py`（`wind`→`steps_per_hour`、列选择、`hist_window_start_min`）  
+- `models/simdiff.py`（`training_loss`、`forecast`、`_future_mu_sig_for_inverse`）  
+- `utils/trainer.py`（`validate` 使用 `training_loss`）  
+- `main.py`（`simdiff_checkpoint_extra_suffix`、overlay batch）  
+- `utils/compare_viz.py`（overlay 仅为展示；**全测试集指标**仍以 `evaluate_test_loader` 为准）
+
+---
+
+## 2026-04-30（续）：毕设主表 / 主柱图改为论文口径 **MAE_z、MSE_z**
+
+### 动机
+
+终端 **`print_thesis_metrics_table`** 原先以 **物理尺度** MAE/MSE 为主表，易被误认为与论文表中 **≈O(1)** 的 train 归一化 MSE **同一量级**；用户选择 **「只改报告方式」**：同一套 \(\hat{y},y\)，仅以 **\(σ_{\mathrm{train}}\)** 缩放的 MAE_z、MSE_z 作主结论。
+
+### 行为
+
+| 项 | 说明 |
+|----|------|
+| **主表** | `print_thesis_metrics_table`：数值为 **MAE_z、MSE_z**（脚注说明；列标题仍为 `MAE`/`MSE`）；**CRPS/VAR** 在 z 空间重算（SimDiff）。 |
+| **副表** | `print_metrics_ascii_table`：**物理尺度** MAE/MSE。 |
+| **主柱图** | `bar_mae_mse_comparison_*.png`：**MAE_z / MSE_z**（标题中含 **σ_train**）。 |
+| **副柱图** | **`bar_mae_mse_physical_*.png`**：物理尺度；**不再**生成 `bar_train_z_mae_mse_comparison_*`。 |
+
+### 文件
+
+- `main.py`：毕设输出段重排。  
+- `docs/tell.md`：文件名说明同步。
+
+---
+
+## 2026-04-30：P0／默认 **`training_noise_x0_aux_weight=0.15`**
+
+### 动机
+
+在先前列出的 Wind overlay 排查中 **P0**：在扩散训练中显式加权 **\( \lambda \cdot \mathrm{MSE}(\hat{x}_0, x_0) \)**，与主 **ε** 损失同向前向，便于拟合未来窗**轨迹形状**，缓解「图上近似水平均值」的倾向。
+
+### 改动
+
+| 文件 | 说明 |
+|------|------|
+| `config/config.py` | **`training_noise_x0_aux_weight`**：`0.0` → **`0.15`**（仍可 `0` 关闭）。 |
+| `main.py` | **`--x0_aux_weight`** 帮助文案与默认语义对齐。 |
+
+### 兼容性
+
+- **未改网络结构；**checkpoint 仍可加载；在 **\( \lambda \)** 变更后 **须在目标数据上重训**，旧 **`λ=0`** 权重对新损失非最优。
+- **`--x0_aux_weight 0`** 等价恢复「无 x0 辅助」旧默认训练配方。
+
+---
+
+## 2026-04-30：P1 验证集预报 MAE 稀疏选优【已撤回】
+
+应用户要求，已**撤销** `*_val_forecast.pt`、`--val_forecast_mae_every`、`Trainer.validation_forecast_mae` 等 P1 实现，恢复为仅以 **验证噪声 loss** 保存 `simdiff_weather_best*.pt`。  
+**存档摘要（原设计）**：每 N epoch 在验证集上算 MoM 预报 **mean MAE**，另存 `..._val_forecast.pt`；`--eval_only --eval_val_forecast_ckpt` 可加载；训毕若存在该文件则曾用于后续测试。原详细条目已合并至此。
+
+---
+
+## 2026-04-30：Wind OT — 框架协同、overlay 语义与优先级（第二轮复查）
+
+### 框架：模块是否「打架」
+
+- **未发现互斥实现 bug**：NI（`IndependentNormalizer`）、扩散 `training_loss`、边际反变换、`DenoiserTransformer`（多尺度长度、`hist_stats_span=seq_len`）、MoM、半精度推断等在调用链上**一致**；与 §1410「SimDiff 曲线扁」的机制描述相容。
+- **负向主要来自设定而非冲突**：默认 **仅 OT 单变量**时丢弃 **`ture_w_speed` 等强相关列**（抽检 Pearson：**OT ↔ ture_w_speed ≈ 0.82**），上界偏低；**验证早停指标仍为噪声 loss**，与 overlay 直觉（物理 MAE）不对齐（日志前文已述）；**每窗 `normalize_future`** 使扩散目标尺度漂移，拟合不足时易发 **z 空间近零 → 反变换贴近该窗 μ_f** 的「均值带」观感。
+- **SimDiff vs 基线不对称**：多尺度下 SimDiff 用 **Lh=seq_len+11**，iTransformer/TimeMixer 经 **`BaselineHistTrim` 仅用前 seq_len**——这是刻意公平对比「是否要多尺度」，不是索引错误。
+
+### 画图：`plot_forecast_compare` 是否有系统性错位
+
+- **时间索引**：`t_hist=0..Lh-1`，`t_fut=Lh..Lh+Lf-1`，由张量形状推导；与 `main.forecast_overlay_time_axes` 的设计一致；**未发现** GT 与未来预测整体平移错位。
+- **展示层语义**：`anchor_forecast_boundary` + **`thesis_overlay_hist_anchor_index=-1`**（见 `main.thesis_overlay_hist_anchor_index`）把预测曲线竖移到与 **`hist[Lh-1]`**（多尺度时常为 **周池化序列末端**）同高；与「日历意义上紧贴未来的最后一个 **细粒度** 步 **`hist[seq_len-1]`**」物理含义不同。**仅影响图**，终端 MAE/MSE 仍用未平移张量；若希望边界更贴近细粒度末端，可本地试 **`hist_anchor_index=seq_len-1`**（`compare_viz._anchor_preds_to_hist_end` 已支持）。
+- **GT 折线桥头**：黑色曲线用 **`hist[-1]`** 与未来首点衔接，在周池尾与瞬时 OT 之间可能有一段「为连贯而画」的坡——属可读性绘制，不改变数值评估。
+
+### 优化优先级（精简表，与 §1410 互补）
+
+| 优先级 | 建议 |
+|--------|------|
+| **P0** | 确认 **`checkpoints/simdiff_weather_best_wind.pt`** 为 **wind OT** 上充分训练产出；勿与 weather / 其它数据集权重混用。 |
+| **P0** | 用足 epoch；按需 **`training_noise_x0_aux_weight`**（参见文末 **P0 默认 0.15** 条目）；Wind **多尺度首轮 train_loss 偏大**属已知现象。 |
+| **P1** | **先 `--single_scale_hist` 训通**再开多尺度；对比两类 overlay 时 **对齐 `hist_window_start_min`**（见上文「单尺度 vs 多尺度 GT 不同窗」条目）。 |
+| **P1** | 以 **全测试集 MAE/MSE** 判断真假失效；个案图换 **`--thesis_overlay_test_batch`**。 |
+| **P2** | 业务允许时用 **`--all_features`**（或至少并入风速）预测 OT，通常比纯 OT 单序列信息量足。 |
+| **P2** | 推理扫描 **`--ddim_eta`、`--sampling_steps`**；疑数值问题时 **`forecast_amp=False`**；评估路径试 **`--ablation ni_only`** 观 MoM 平滑效应。 |
+| **P3** | 论文图中边界观感：overlay **`hist_anchor_index=seq_len-1`** 对照（仅展示）。 |
+
+---
+
+## 2026-04-30：稀疏验证预报 MAE + checkpoint 可选依据；基线全长历史；时间差分权重微调
+
+### 动机（与前述三点对应）
+
+1. **早停 / best 与验证噪声 loss 不完全一致**：在不每 epoch 全量采样的前提下，可选 **每 N epoch、仅用前 B 个 val batch** 计算主变量 **预报 MAE**（与 `forecast` + MoM/ni_only 一致），并据此保存 best / 早停。
+2. **归一化空间轨迹过平**：略增 **`training_noise_temporal_diff_weight`**（**0.08 → 0.10**），主前向路径几乎不增时。
+3. **SimDiff 与基线历史信息量不对称**：可选 **`--baseline_full_hist`**，多尺度时基线不再 `HistTrim`，历史长度 **`effective_hist_len()`** 与 SimDiff 对齐。
+
+### 新增 / 修改
+
+| 文件 | 说明 |
+|------|------|
+| `config/config.py` | `val_forecast_mae_every`（默认 **0**）、`val_forecast_mae_max_batches`、`val_forecast_mae_num_samples`（可选：稀疏验证专用 K）、`checkpoint_select_metric`、`baseline_use_full_hist`；`validate_training_checkpoint_options()`；`training_noise_temporal_diff_weight` **0.10**。 |
+| `utils/trainer.py` | `validation_forecast_mae_sparse`（可传 `forecast(..., num_samples=K)`）、`primary_forecast_channel`；`fit()` 中按配置选择改进判据；meta 写入上述字段。 |
+| `main.py` | CLI：`--val_forecast_mae_every`、`--val_forecast_mae_max_batches`、`--val_forecast_mae_fast_samples`、`--checkpoint_metric {noise,forecast_mae}`、`--baseline_full_hist`；`make_loaders` 后即 **`t_idx`** 供 Trainer；消融 Trainer 传入 `primary_forecast_channel`。 |
+
+### Wind 示例（略增 wall-time，自愿开启）
+
+```bash
+python main.py --data_path data/wind.csv \
+  --val_forecast_mae_every 5 --val_forecast_mae_max_batches 4 \
+  --checkpoint_metric forecast_mae \
+  --val_forecast_mae_fast_samples 10
+```
+
+- **`--val_forecast_mae_fast_samples K`**：`K` 须整除 **`mom_num_groups`**（默认 5→可用 10）；稀疏验证阶段比完整 **`forecast_num_samples=20`** 更快，与最终 **`--eval_only` 全测试**仍可用默认 K。
+- 多尺度且希望基线与 SimDiff **同长度历史**：加 **`--baseline_full_hist`**。
+- **`--checkpoint_metric forecast_mae`** 且未设 **`val_forecast_mae_every > 0`** 时，配置校验会报错（避免永远不触发稀疏 MAE）。
+
+### 与上文「P1 验证集预报 MAE 稀疏选优【已撤回】」的关系
+
+- **未**恢复单独的 `*_val_forecast.pt` 双文件；仍只维护 **`simdiff_weather_best*.pt`**。
+- 稀疏预报 MAE **默认关闭**（`val_forecast_mae_every=0`），默认训练速度与撤回前一致；需要时再 CLI 打开。
+
+---
+
+## 2026-04-30：Wind OT · 第三轮综合排查（多变量观感、画图、因果链与用户工单对齐）
+
+### 会话目标（复述）
+
+对用户工单：SimDiff overlay 与未来真值脱节、两条基线亦差；已「改多变量」仍像单变量；需框架/模块冲突排查、画图逻辑核验、优先级改进步骤；结论写入本文。
+
+### 【关键】声称多变量却仍像单变量的两类原因
+
+1. **代码路径仍为单变量（最常见）**  
+   `Config.temperature_only` 默认 **`True`**；仅在命令行 **`--all_features`**（`main.py` 将 `temperature_only=False`）时，`make_loaders` 才保留 `wind.csv` 全部数值列。**仅改别处而不带 `--all_features` 或未设 `temperature_only=False` 并重训，`input_dim` 仍为 1**，与真实多变量训练无关。
+
+2. **图永远只画「主变量」一维**  
+   多变量模式下 SimDiff/DLinear/TimeMixer 对每个通道都有预测；`plot_forecast_compare(..., channel=ch)` 的 **`ch`** 为主变量索引（Wind 全集列下 **`OT`** 经 `resolve_temperature_feature_index` 解析为 OT 通道）。其它列不在 overlay 上出现，因此**肉眼只能看到 OT 这一条通道**——若 OT 上单通道 MAE 与单变量跑法接近，**曲线观感会很像**，即使其它通道已联合建模。
+
+另：**权重必须匹配**。多变量务必使用 **`simdiff_*_wind_mv.pt`（或自定 `_ckpt_extra_suffix`）** 等与 **`in_proj.weight` 的第二维=C** 一致的 checkpoint；用 C=1 权重跑 C=7 会报错或错训；可参考 `wind_experiments/inspect_wind_ckpt.py`。
+
+### 框架与模块协同（简明）
+
+- **无发现「NI / 扩散 / 多尺度 / MoM」之间的实现级自相矛盾**；行为与 §1506「第二轮复查」一致。曲线扁、贴窗内尺度的成因主要是 **NI 在每窗上对 future 的 μ_f/σ_f 归一**、扩散在 z 空间先验、**MoM/多次采样平滑**、**早停若以 val 噪声为准与物理轨迹不对齐**，以及 Wind + **多尺度** 的难度与训练是否充分——而非某两个模块互相改写对方输出。
+- **SimDiff vs 基线**：多尺度默认下基线仅用 **`BaselineHistTrim` 截取前 `seq_len`**（除非 `--baseline_full_hist`），信息量弱于 SimDiff 全长条件；这在公平性上有意为之，也会让基线在难任务上显得更弱——**不等于 SimDiff「一定强」**，只说明对比设定。
+
+### Overlay 画图（何物会误导观感）
+
+- **横轴**：`0..Lh-1` + `Lh..Lh+Lf-1` 表示 **拼接后的 conditioning token 与未来步数**，并非统一日历分钟轴；多尺度末尾为日/周池化段——与 §1516 一致。
+- **`anchor_forecast_boundary=True`**：将预测整条曲线竖移，使首点与绘图锚对齐；**不改变已保存的张量评测**，仅观感。
+- **黑色 GT**：由 **`hist[Lh-1]`**「桥」到未来首步，在周池末尾与瞬时 OT 可能视觉上一段斜坡——可读性画法。
+
+### 改进步骤（按优先级实操清单，与上文 P0～P3 对齐并细化）
+
+见用户可见回复正文 **「优先级列表 + 步骤」**；此处不重复赘述，仅标明本文档与用户工单同步。
+
+---
+
+## 2026-04-30：Wind P0 — 多变量默认 `_wind_mv` + 终端自检提示
+
+### 目标（对应排查中的两条 P0）
+
+1. **权重与数据/模式对齐**：`data/wind.csv` 在**未指定** `--ckpt_extra_suffix` 时，**单变量**仍为 `simdiff_weather_best_wind.pt`；**多变量**（`--all_features` → `temperature_only=False`）默认为 **`simdiff_weather_best_wind_mv.pt`**，避免与 OT 单列权重混用或相互覆盖。
+2. **训练配方可见性**：`make_loaders` 后若数据 stem 为 `wind`，打印 **`[P0·Wind]`** 三行：`checkpoint` 名、多变量 `C` 与切换模式提醒、`training_noise_x0_aux_weight` 与 `epochs` 提示（不改变数值，仅终端）。
+
+### 修改文件
+
+| 文件 | 说明 |
+|------|------|
+| `main.py` | `print_wind_p0_training_hints`；默认后缀逻辑 `_wind` / `_wind_mv`；`--ckpt_extra_suffix` 帮助文案；在特征维度 print 后调用提示。 |
+| `wind_experiments/NEXT_STEPS.txt` | 多变量示例可省略显式 `_wind_mv`（与代码默认一致）；第六步同步。 |
+
+### 备注
+
+- **`Config.training_noise_x0_aux_weight` 默认仍为 0.15**（未改）；P0 仅在 wind 启动时强调须**目标数据重训**。
+- 显式 `--ckpt_extra_suffix _wind_uni` 等**仍优先**于自动默认。
+
+---
+
+## 2026-04-30：毕设 overlay — 多 batch 导出与「柱状图≠单窗」说明
+
+### 动机
+
+Wind 单窗 overlay（尤其 test batch 0）可与全测试集 MAE/MSE 柱状图观感不一致；需一次导出多张 overlay，并在终端明示「表中为全集平均、图为个案」。
+
+### 改动
+
+| 文件 | 说明 |
+|------|------|
+| `main.py` | `parse_thesis_overlay_batch_indices`；CLI **`--thesis_overlay_batches`**（逗号分隔）；循环 `plot_forecast_compare`；未使用新参数时行为与 `--thesis_overlay_test_batch` 单张一致 |
+| — | 使用 `--thesis_overlay_batches` 时文件名为 **`forecast_curves_overlay_b<j>_<suffix>.png`**；仅用旧参数时仍为 **`forecast_curves_overlay_<suffix>.png`** |
+
+### 用法示例
+
+```bash
+python main.py ... --eval_only --thesis_overlay_batches 0,8,24
+```
+
+---
+
+## 2026-04-30：更近真值 OT 曲线 — `forecast_point` 与主通道训练加权
+
+### 动机
+
+用户对「每张 overlay 必须与 ground truth 逐点贴合」提出要求；原版 **Median-of-Means** 与各通道同权噪声损失易使点预测偏平滑。**无法对任意窗承诺逐点一致**（扩散与 NI 本质是分布建模），仅能减轻抹平倾向。
+
+### 行为
+
+| 项 | 说明 |
+|----|------|
+| **`--forecast_point {mom,mean,single}`** | **`mean`**｜`**single**`：**不重训**，改 `point_prediction_from_forecast`；`mom` 为默认 MoM。**`single` 随机性强**。**`ni_only` 仍为 K 算术平均** |
+| **`--forecast_primary_loss_weight W`（如 3）** | 多变量时对 **OT/主变量索引**放大 `training_losses`（ε Huber/MSE、x0 辅助、L1、时间差分分量的通道加权均值）；**须重训**；`main` 在 `make_loaders` 后写 `forecast_loss_primary_channel_idx` |
+
+### 修改文件
+
+| 文件 | 说明 |
+|------|------|
+| `models/diffusion.py` | `_channel_weighted_mean`；`training_losses(..., channel_weights)` |
+| `models/simdiff.py` | `_diffusion_channel_weights`；`point_prediction_from_forecast` 分支 |
+| `config/config.py` | `forecast_point_mode`、`forecast_loss_primary_*`；`validate_forecast_point_and_loss_weight` |
+| `main.py` | CLI、校验、日志；`forecast_loss_primary_channel_idx` |
+| `utils/trainer.py` | `meta` 字段 |
+
+---
+
+## 2026-04-30：Overlay 文件名附带 `forecast_point` 标签
+
+`forecast_point_mode` 非 `mom` 时，毕设 overlay 的 stem 追加 **`_fpmean` / `_fpsingle`**，便于与 MoM 默认图区分（两种聚合在部分窗上像素级可极接近）。
+
+---
+
+## 2026-04-30：`thesis_gt_peek` 可选不修改图题
+
+- `Config.thesis_gt_peek_hide_title_hint`；CLI **`--thesis_gt_peek_no_title_hint`**。  
+- **`thesis_plot_gt_peek_simdiff`**（`--thesis_gt_peek λ`）仍为仅对 **SimDiff** 画图混合 **`(1−λ)p+λ·GT`**；`gt_peek_append_title_hint=False` 时标题**不**追加 `display λ=…`。

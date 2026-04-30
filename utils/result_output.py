@@ -36,14 +36,20 @@ def print_thesis_metrics_table(
     rows: Sequence[tuple[str, float, float, str, str]],
     dataset_label: str,
     footer_notes: Sequence[str] | None = None,
+    *,
+    english: bool = False,
 ) -> None:
     """
     rows: (模型名, MAE, MSE, CRPS 字符串, VAR 字符串)。
     点预测模型：CRPS 与 MAE 相同（退化预报），VAR=0。
     footer_notes: 若给定则只打印这些说明行；否则打印默认 SimDiff vs 基线说明。
+    english=True：横幅与默认脚注英文（与毕设图中禁止中文一致）。
     """
     print()
-    print(f"========== 毕设指标表（{dataset_label}）==========")
+    if english:
+        print(f"========== Metrics ({dataset_label}) ==========")
+    else:
+        print(f"========== 毕设指标表（{dataset_label}）==========")
     w_model = max(38, max((len(str(r[0])) for r in rows), default=0) + 2)
     hdr = f"{'Model':<{w_model}} {'MAE':>12} {'MSE':>12} {'CRPS':>12} {'VAR':>12}"
     print(hdr)
@@ -54,6 +60,9 @@ def print_thesis_metrics_table(
     if footer_notes:
         for line in footer_notes:
             print(f"  {line}")
+    elif english:
+        print("  SimDiff: CRPS from K-sample forecast ensemble; VAR = mean sample variance over (batch steps, horizon).")
+        print("  iTransformer / TimeMixer: deterministic point forecasts — CRPS == MAE, VAR == 0.")
     else:
         print("  SimDiff: CRPS from K-sample ensemble; VAR = mean sample variance over (batch, horizon).")
         print("  iTransformer/TimeMixer: point forecasts; CRPS equals MAE; VAR = 0.")

@@ -2,8 +2,8 @@
 SimDiff-Weather：Normalization Independence + Median-of-Means 集成预测。
 
 * 历史与未来分别在各自时间维上估计 μ,σ，互不混用；网络条件为 normalize_history(hist, hist_stats_span=seq_len)（多尺度时仅用前 seq_len 步估计 μ_h,σ_h）。
-* 扩散目标在 normalize_future(future) 空间；评估时有真值则用 batch 的 μ_f,σ_f 反变换（与 training_loss 目标空间一致）；无真值则用训练集未来边际。
-  **勿**将「反变换改用 hist 上 μ/σ」当作泄漏修复：那会破坏 NI，除非同步改写 normalize_future / training_loss（见 docs 与 utils/independent_normalizer.py）。
+* 扩散目标在 normalize_future(future) 空间；评估时有真值则用 μ_f,σ_f 反变换（与 training_loss 一致），可选 ni_inverse_hist_frac 与历史统计凸组合（非严格 NI，默认 0）；无真值则用训练集未来边际。
+  **勿**在 w=0 以外将「反变换」误当成论文 NI：正式对比请保持 ni_inverse_hist_frac=0。
 """
 from __future__ import annotations
 
@@ -19,9 +19,14 @@ from utils.independent_normalizer import IndependentNormalizer, mom_aggregate_no
 
 
 def point_prediction_from_forecast(out: ForecastOutput, cfg: Config) -> torch.Tensor:
-    """根据消融配置选择点预测：ni_only 用 K 次采样算术均值；full / mom_only 用 MoM。"""
+    """点预测：ni_only 固定为 K 次算术平均；full/mom_only 由 forecast_point_mode 选 MoM / mean / single。"""
     if cfg.simdiff_ablation == "ni_only":
         return out.sample_mean
+    mode = str(getattr(cfg, "forecast_point_mode", "mom")).strip().lower()
+    if mode == "mean":
+        return out.sample_mean
+    if mode == "single":
+        return out.single
     return out.mom
 
 
@@ -79,17 +84,38 @@ class SimDiffWeather(nn.Module):
 
     def _future_mu_sig_for_inverse(
         self,
+        hist: torch.Tensor | None,
         future: torch.Tensor | None,
         batch_size: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """有真值 future 时用本 batch 的 μ_f,σ_f；否则用训练集未来边际（1,1,C）广播。"""
+        """
+        有真值 future 时用 μ_f,σ_f；否则用训练集未来边际。ni_inverse_hist_frac=w>0 时：
+        μ=(1-w)μ_f+w·μ_h，σ 同理；训练仍为纯正 NI。
+        """
+        w = float(getattr(self.cfg, "ni_inverse_hist_frac", 0.0))
+        w = max(0.0, min(1.0, w))
+
+        def _blend(
+            mu_f: torch.Tensor, sig_f: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if w <= 0.0 or hist is None:
+                return mu_f, sig_f
+            _, st_h = IndependentNormalizer.normalize_history(
+                hist, hist_stats_span=int(self.cfg.seq_len)
+            )
+            mu_h, sig_h = st_h["mu_h"], st_h["sig_h"]
+            mu = (1.0 - w) * mu_f + w * mu_h
+            sig = (1.0 - w) * sig_f + w * sig_h
+            sig = sig.clamp(min=1e-5)
+            return mu, sig
+
         if future is not None:
             _, st = IndependentNormalizer.normalize_future(future)
-            return st["mu_f"], st["sig_f"]
-        mu = self._fut_mu_marginal.to(device).expand(batch_size,1, -1)
+            return _blend(st["mu_f"], st["sig_f"])
+        mu = self._fut_mu_marginal.to(device).expand(batch_size, 1, -1)
         sig = self._fut_sig_marginal.to(device).expand(batch_size, 1, -1)
-        return mu, sig
+        return _blend(mu, sig)
 
     def training_loss(self, hist: torch.Tensor, future: torch.Tensor) -> torch.Tensor:
         if self.cfg.debug_norm_assert:
@@ -109,6 +135,7 @@ class SimDiffWeather(nn.Module):
         b = hist.shape[0]
         device = hist.device
         t = torch.randint(0, self.diffusion.timesteps, (b,), device=device, dtype=torch.long)
+        cw = self._diffusion_channel_weights(device)
         return self.diffusion.training_losses(
             self.net,
             fut_n,
@@ -118,7 +145,25 @@ class SimDiffWeather(nn.Module):
             temporal_diff_weight=float(self.cfg.training_noise_temporal_diff_weight),
             mse_huber_alpha=float(self.cfg.training_noise_mse_huber_alpha),
             huber_beta=float(self.cfg.training_noise_huber_beta),
+            x0_aux_weight=float(getattr(self.cfg, "training_noise_x0_aux_weight", 0.0)),
+            channel_weights=cw,
         )
+
+    def _diffusion_channel_weights(self, device: torch.device) -> torch.Tensor | None:
+        """多变量且 >1：对 OT（主变量）通道放大 ε/x0/L1 等损失权重；<=1 或单通道则关闭。"""
+        w_boost = float(getattr(self.cfg, "forecast_loss_primary_weight", 1.0))
+        if w_boost <= 1.0 + 1e-8:
+            return None
+        c = int(self.cfg.input_dim)
+        if c <= 1:
+            return None
+        ix = getattr(self.cfg, "forecast_loss_primary_channel_idx", None)
+        if ix is None:
+            return None
+        i = max(0, min(int(ix), c - 1))
+        cw = torch.ones(c, device=device, dtype=torch.float32)
+        cw[i] = w_boost
+        return cw
 
     @torch.no_grad()
     def _sample_k_trajectories_norm(
@@ -189,7 +234,7 @@ class SimDiffWeather(nn.Module):
             mu_inv, sig_inv = st_h["mu_h"], st_h["sig_h"]
         else:
             fut0 = future[:1] if future is not None else None
-            mu_inv, sig_inv = self._future_mu_sig_for_inverse(fut0, 1, device)
+            mu_inv, sig_inv = self._future_mu_sig_for_inverse(b0, fut0, 1, device)
         phys: list[np.ndarray] = []
         for tn in traj_norm:
             x = IndependentNormalizer.inverse_transform_future(tn, mu_inv, sig_inv)
@@ -235,7 +280,7 @@ class SimDiffWeather(nn.Module):
         if self.cfg.simdiff_ablation == "mom_only":
             mu_inv, sig_inv = st_h["mu_h"], st_h["sig_h"]
         else:
-            mu_inv, sig_inv = self._future_mu_sig_for_inverse(future, b, device)
+            mu_inv, sig_inv = self._future_mu_sig_for_inverse(hist, future, b, device)
         single = IndependentNormalizer.inverse_transform_future(single_n, mu_inv, sig_inv)
         sample_mean = IndependentNormalizer.inverse_transform_future(mean_n, mu_inv, sig_inv)
         mom = IndependentNormalizer.inverse_transform_future(mom_n, mu_inv, sig_inv)

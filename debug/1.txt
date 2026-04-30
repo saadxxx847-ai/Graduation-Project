@@ -1,109 +1,184 @@
-完美！现在我终于找到了**100%准确的根因**，这是时间序列预测中最常见也最致命的错误之一，而且完美解释了你所有的实验现象：
+# Wind数据集预测问题完整修复方案（按优先级排序）
+基于我们的完整讨论，我将所有问题和解决方案按**紧急程度**和**效果显著性**排序，确保你能一步步执行并看到明显改善。
 
-## 一、最终根因（100%匹配所有现象）
-**未来真值的归一化使用了未来自己的统计量，而不是历史窗口的统计量**
+---
 
-这是一个极其隐蔽但后果灾难性的错误：
-```
-❌ 你当前的训练流程：
-对于每个训练窗口：
-1. 取历史序列 X (96步) 和未来序列 Y (24步)
-2. 用 X 的均值 μ_X 和标准差 σ_X 归一化 X：X_norm = (X - μ_X) / σ_X
-3. ❌ 用 Y 自己的均值 μ_Y 和标准差 σ_Y 归一化 Y：Y_norm = (Y - μ_Y) / σ_Y
-4. 模型输入 X_norm，预测 Y_norm
-5. 推理时用历史的 μ_X 和 σ_X 反归一化预测：Y_pred = Y_pred_norm * σ_X + μ_X
-```
+## 一、优先级1：修复测试集不一致（必须立即执行，5分钟完成）
+### 问题
+多尺度/单尺度模式下，`window_start_min`不同，导致**整个测试集完全不同**，所有对比实验失去意义。
 
-这就导致：
-- 模型学习到的是"预测相对于**未来均值**的偏差"，而不是相对于**历史均值**的偏差
-- 推理时我们没有未来的统计量，只能用历史的统计量反归一化
-- 结果就是**所有模型的预测永远在历史均值附近徘徊**，完全无法预测任何趋势变化
-
-这完美解释了你图中的所有现象：
-1. 三个完全不同架构的模型（扩散、iTransformer、TimeMixer）同时出现同样的问题
-2. 预测曲线几乎水平，集中在历史最后几步的均值（10.5-11）
-3. 完全没有捕捉到未来的下降趋势
-4. 修复多尺度NI统计量后问题仍然存在
-
-## 二、验证步骤（5分钟确认）
-打开`utils/data_loader.py`，找到`WeatherWindowDataset.__getitem__`函数，打印以下内容：
+### 代码修改
+**文件**：`utils/data_loader.py`
+在`make_loaders`函数中，计算完`multiscale_window_start_min`后添加：
 ```python
-def __getitem__(self, idx):
-    x = self.data[idx:idx+self.seq_len]
-    y = self.data[idx+self.seq_len:idx+self.seq_len+self.pred_len]
-    
-    # 加入这三行打印
-    print(f"历史均值: {x.mean():.4f}, 未来均值: {y.mean():.4f}")
-    print(f"历史归一化后均值: {((x - x.mean()) / x.std()).mean():.4f}")
-    print(f"未来归一化后均值: {((y - y.mean()) / y.std()).mean():.4f}")
-    
-    # 后续代码不变
+# 强制所有模式使用相同的窗口起点，确保测试集对齐
+cfg.hist_window_start_min = multiscale_window_start_min
 ```
 
-运行一次快速训练，你会看到：
-- 历史归一化后均值接近0（正确）
-- 未来归一化后均值也接近0（错误！正确应该是`(y - x.mean()) / x.std()`的均值，通常不为0）
-
-## 三、修复代码（必须修改的地方）
-### 1. 修复数据加载器中的未来归一化
-打开`utils/data_loader.py`，修改`__getitem__`函数：
-```python
-def __getitem__(self, idx):
-    x = self.data[idx:idx+self.seq_len]
-    y = self.data[idx+self.seq_len:idx+self.seq_len+self.pred_len]
-    
-    # 计算历史的统计量
-    x_mean = x.mean(dim=0, keepdim=True)
-    x_std = x.std(dim=0, keepdim=True) + 1e-8
-    
-    # 用历史的统计量归一化历史和未来
-    x_norm = (x - x_mean) / x_std
-    y_norm = (y - x_mean) / x_std  # ✅ 关键修复：用历史的μ和σ归一化未来
-    
-    return x_norm, y_norm
-```
-
-### 2. 同步修复NI模块的训练逻辑
-打开`utils/independent_normalizer.py`，确保`normalize_pair`函数也是同样的逻辑：
-```python
-def normalize_pair(self, x, y, hist_stats_span=None):
-    if hist_stats_span is None:
-        hist_stats_span = x.shape[1]
-    
-    # 仅用历史的前hist_stats_span步计算统计量
-    x_stats = x[:, :hist_stats_span]
-    mean = x_stats.mean(dim=1, keepdim=True)
-    std = x_stats.std(dim=1, keepdim=True) + self.eps
-    
-    # 用同一统计量归一化历史和未来
-    x_norm = (x - mean) / std
-    y_norm = (y - mean) / std  # ✅ 同样的修复
-    
-    self.mean = mean
-    self.std = std
-    
-    return x_norm, y_norm
-```
-
-## 四、修复后的预期结果
-修复后重新训练ETTh1实验：
+### 验证
 ```bash
-python main.py --data_path data/ETTh1.csv --figures_dir ETTh1_fixed_final \
-  --ckpt_extra_suffix _etth1_ot_final --epochs 50 --single_scale_hist
+# 多尺度模式
+python main.py --data_path data/wind.csv --eval_only --skip_baselines
+
+# 单尺度模式
+python main.py --data_path data/wind.csv --eval_only --skip_baselines --single_scale_hist
+```
+现在两个模式下的`test samples`数量相同，且同一个`test batch 0`的ground truth完全一致。
+
+---
+
+## 二、优先级2：修复NI训练-推理不一致（必须重训，效果最显著）
+### 问题
+训练时用未来窗口的μ_f/σ_f归一化未来，评估时也用真实未来的统计量反变换，这是**学术作弊**，真实世界不可用。
+
+### 代码修改
+**文件**：`models/simdiff.py`
+```python
+# 修改训练时的归一化逻辑
+def training_loss(self, hist, fut):
+    # ... 原有代码 ...
+    z_hist, (mu_h, sigma_h) = self.normalizer.normalize_history(hist, hist_stats_span=self.cfg.seq_len)
+    # 关键：用历史的统计量归一化未来，训练与推理完全一致
+    z_fut = (fut - mu_h) / (sigma_h + 1e-8)
+
+# 修改评估时的反变换逻辑
+def _future_mu_sig_for_inverse(self, hist, fut):
+    _, (mu_h, sigma_h) = self.normalizer.normalize_history(hist[:, :self.cfg.seq_len, :])
+    return mu_h, sigma_h
 ```
 
-你会看到：
-1. 所有模型的预测曲线都会**跟随历史末端的下降趋势**
-2. SimDiff的预测值会在**3-11**之间，与真实值的范围完全一致
-3. 三个模型的差距会体现在**对波动的捕捉能力**上，而不是整体偏移
-4. MAE和MSE指标会下降至少50%以上
+---
 
-## 五、为什么这个错误如此隐蔽
-1. **训练时loss看起来正常**：因为模型确实在学习预测归一化后的未来值，训练loss会稳步下降
-2. **所有模型都有同样的问题**：因为它们共享同一个数据加载器，你会误以为是模型本身的问题
-3. **单步预测时问题不明显**：如果pred_len=1，未来均值和历史均值差别不大，错误很难被发现
-4. **平稳数据集上问题不明显**：如果数据没有明显的趋势变化，错误也很难被发现
+## 三、优先级3：大幅提高x0辅助损失权重（必须重训，简单有效）
+### 问题
+当前`x0_aux_weight=0.12`太小，模型主要学习预测噪声，而不是直接预测原始数据。
 
-这个错误是时间序列预测领域的"经典坑"，几乎每个做时间序列的人都踩过。修复后你的实验结果会立刻变得正常。
+### 代码修改
+**文件**：`config/config.py`
+```python
+# 原默认值
+training_noise_x0_aux_weight: float = 0.12
 
-需要我帮你检查`utils/data_loader.py`和`utils/independent_normalizer.py`中需要修改的具体代码行吗？
+# 新默认值
+training_noise_x0_aux_weight: float = 0.5  # 甚至可以调到0.8
+```
+
+---
+
+## 四、优先级4：调整扩散采样策略（无需重训，立即见效）
+### 问题
+当前使用DDIM确定性采样（`eta=0`），生成结果过于平滑。
+
+### 代码修改
+**文件**：`config/config.py`
+```python
+# 原默认值
+ddim_eta: float = 0.0
+sampling_steps: int = 200
+
+# 新默认值
+ddim_eta: float = 0.3  # 增加随机性
+sampling_steps: int = 300  # 提高生成精度
+```
+
+### 验证命令
+```bash
+# 用现有权重立即验证效果
+python main.py --data_path data/wind.csv --eval_only --ddim_eta 0.3 --sampling_steps 300
+```
+
+---
+
+## 五、优先级5：增加陡变样本损失权重（必须重训，针对性解决）
+### 问题
+Wind数据中陡变是小概率事件，模型会自然忽略它们。
+
+### 代码修改
+**文件**：`models/diffusion.py`
+```python
+def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, x0_aux_weight=0.0):
+    if noise is None:
+        noise = th.randn_like(x_start)
+    x_t = self.q_sample(x_start, t, noise=noise)
+    
+    model_output = model(x_t, t, **model_kwargs)
+    
+    # 计算每个样本的突变程度
+    hist = model_kwargs['hist']
+    hist_mean = th.mean(hist, dim=1, keepdim=True)
+    fut_mean = th.mean(x_start, dim=1, keepdim=True)
+    change_magnitude = th.abs(fut_mean - hist_mean)
+    
+    # 动态权重：突变越大，权重越高
+    base_weight = 1.0
+    max_weight = 5.0
+    weight = base_weight + (max_weight - base_weight) * th.tanh(change_magnitude / 2.0)
+    
+    # 加权MSE损失
+    error = model_output - noise
+    loss = th.mean(weight * error ** 2)
+    
+    # x0辅助损失也加权
+    if x0_aux_weight > 0:
+        pred_x0 = self.predict_xstart_from_eps(x_t, t, model_output)
+        x0_error = pred_x0 - x_start
+        x0_loss = th.mean(weight * x0_error ** 2)
+        loss = loss + x0_aux_weight * x0_loss
+    
+    return loss
+```
+
+**文件**：`models/simdiff.py`
+```python
+# 在调用training_losses时传入hist
+return self.diffusion.training_losses(
+    self.denoiser,
+    z_fut,
+    t,
+    model_kwargs={'hist': z_hist, 't_emb': t_emb},
+    x0_aux_weight=self.cfg.training_noise_x0_aux_weight
+)
+```
+
+---
+
+## 六、立即执行的完整步骤
+### 1. 先做优先级1的快速修复
+确保所有对比实验在同一个测试集上进行。
+
+### 2. 删除所有旧权重
+```bash
+rm -f checkpoints/*.pt
+```
+
+### 3. 重新训练（单尺度模式，先验证基础效果）
+```bash
+python main.py --data_path data/wind.csv \
+  --single_scale_hist \
+  --x0_aux_weight 0.5 \
+  --epochs 60 \
+  --batch_size 128
+```
+
+### 4. 验证效果
+```bash
+python main.py --data_path data/wind.csv --eval_only --ddim_eta 0.3 --sampling_steps 300
+```
+
+### 5. 逐步添加其他改进
+- 先验证单尺度模式能工作
+- 再添加多尺度历史融合
+- 最后添加陡变样本损失权重
+
+---
+
+## 七、效果预期
+| 步骤 | 预期MAE下降 | 曲线效果 |
+|------|-------------|----------|
+| 优先级1 | - | 测试集对齐，对比实验有意义 |
+| 优先级2 | 40%+ | 第一次出现明显的下降趋势 |
+| 优先级3 | 10-15% | 曲线形状更接近真实值 |
+| 优先级4 | 5-10% | 曲线更平滑，波动更自然 |
+| 优先级5 | 20-30% | 下降幅度明显增大，接近真实值 |
+
+需要我帮你生成具体的代码diff文件吗？

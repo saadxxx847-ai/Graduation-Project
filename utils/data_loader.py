@@ -18,13 +18,18 @@ def resolve_multiscale_steps_per_hour(cfg: Config, data_stem: str) -> int:
     多尺度池化块的「日历跨度」依赖采样间隔：
     - ETTh / hourly：每小时 1 步 → steps_per_hour=1（默认）。
     - ETTm / 15min：每小时 4 步 → steps_per_hour=4。
-    显式 cfg.multiscale_steps_per_hour>0 时优先；否则文件名含 ``ettm`` 推断为 4，其余为 1。
+    显式 cfg.multiscale_steps_per_hour>0 时优先；否则：
+    - 文件名含 ``ettm`` → 15min → 4；
+    - ``wind``（本项目 ``data/wind.csv``，15min）→ 4；
+    其余为 1。
     """
     explicit = getattr(cfg, "multiscale_steps_per_hour", None)
     if explicit is not None and int(explicit) > 0:
         return int(explicit)
     s = data_stem.lower()
     if "ettm" in s:
+        return 4
+    if s == "wind":
         return 4
     return 1
 
@@ -225,6 +230,14 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
     fut_mu, fut_sig = fit_future_marginal_stats(train_ds)
     cfg.train_future_marginal_mean = fut_mu
     cfg.train_future_marginal_std = fut_sig
+
+    # Train-split z-score for paper-style metrics: μ、σ 仅来自训练段完整序列（不含 val/test）。
+    zm = train_mat.mean(axis=0).astype(np.float64)
+    zstd_raw = train_mat.std(axis=0).astype(np.float64)
+    zrel = (1e-4 * np.maximum(np.abs(zm), 1.0)).astype(np.float64)
+    zs = np.maximum(np.maximum(zstd_raw, 1e-5), zrel).astype(np.float32)
+    cfg.train_metric_z_mu = np.asarray(zm, dtype=np.float32)
+    cfg.train_metric_z_sigma = zs
 
     if cfg.use_global_standardization:
         # 保留字段供旧 checkpoint / 外部工具；SimDiff 核心路径已改用窗口独立归一化
