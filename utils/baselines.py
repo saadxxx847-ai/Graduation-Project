@@ -405,6 +405,37 @@ def eval_forecasts_mse_mae(
 
 
 @torch.no_grad()
+def eval_forecasts_mse_mae_train_zscore(
+    predict_fn,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    z_sigma: np.ndarray,
+) -> tuple[float, float]:
+    """
+    多通道：对 (pred−y) 按通道用训练段 σ_train 标准化后，**全测试集、全时域、全通道**
+    上平均 MSE 与 MAE（与单通道版公式一致，量纲为文献常见「train z-score」报告尺度）。
+    返回 ``(MSE_z, MAE_z)``，与 ``eval_forecasts_mse_mae``、``eval_channel_mse_mae_train_zscore`` 的 (mse, mae) 顺序一致。
+    """
+    sig = torch.as_tensor(
+        np.asarray(z_sigma, dtype=np.float64),
+        device=device,
+        dtype=torch.float32,
+    ).reshape(1, 1, -1).clamp_min(1e-12)
+    sum_sq = 0.0
+    sum_abs = 0.0
+    n = 0
+    for hist, fut in test_loader:
+        hist = hist.to(device)
+        fut = fut.to(device)
+        pred = predict_fn(hist)
+        d = (pred - fut) / sig
+        sum_sq += float((d**2).sum().item())
+        sum_abs += float(d.abs().sum().item())
+        n += int(d.numel())
+    return sum_sq / max(n, 1), sum_abs / max(n, 1)
+
+
+@torch.no_grad()
 def eval_channel_mse_mae_train_zscore(
     predict_fn,
     test_loader: torch.utils.data.DataLoader,

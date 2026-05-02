@@ -1677,3 +1677,104 @@ python main.py ... --eval_only --thesis_overlay_batches 0,8,24
 
 - `Config.thesis_gt_peek_hide_title_hint`；CLI **`--thesis_gt_peek_no_title_hint`**。  
 - **`thesis_plot_gt_peek_simdiff`**（`--thesis_gt_peek λ`）仍为仅对 **SimDiff** 画图混合 **`(1−λ)p+λ·GT`**；`gt_peek_append_title_hint=False` 时标题**不**追加 `display λ=…`。
+
+---
+
+## 2026-04-30：`data/exchange_rate.csv` 多变量预测 OT、产出 `exchange/`
+
+### 数据
+
+- **`data/exchange_rate.csv`**：列 `date,0,1,…,6,OT`；去掉 `date` 后为 **8 维多变量**；日频，**`multiscale_steps_per_hour` 默认为 1**（与 ETTh 类似日历语义，非 15min）。
+- **指标与毕设图**：与 wind 一致，**主通道为 `OT`**（`main.resolve_temperature_feature_index` 在多变量表上命中 **`OT`**）；柱状图与 overlay 仅展示 **OT 通道**。
+
+### 代码
+
+| 文件 | 说明 |
+|------|------|
+| `config/config.py` | `resolved_result_dir()`：`data_path` stem 为 **`exchange_rate`** 时 → 项目根 **`exchange/`**（与 `wind/` 同类约定）。 |
+| `main.py` | 未指定 **`--ckpt_extra_suffix`** 时：**单变量**默认 **`_exchange`** → `simdiff_weather_best_exchange.pt`；**`--all_features`**（多变量）默认 **`_exchange_mv`** → `simdiff_weather_best_exchange_mv.pt`。 |
+| `main.py` | **`print_exchange_p0_training_hints`**：终端提示权重与维度，与 Wind P0 提示对称。 |
+| `utils/data_loader.py` | 日频多尺度见文末 **「`exchange_rate` 多尺度 `steps_per_day`」**；`resolve_multiscale_steps_per_hour` 对 stem 仍与非 wind/ettm 一致。 |
+
+### 训练与评估（多变量·主关心 OT）
+
+```bash
+cd Simdiff_weather
+# 训练（8 通道；图与主指标仍为 OT）
+python main.py --data_path data/exchange_rate.csv --all_features
+
+# 仅评估（需已有 checkpoints/simdiff_weather_best_exchange_mv.pt）
+python main.py --data_path data/exchange_rate.csv --all_features --eval_only
+```
+
+- 产出 PNG 与终端表默认在 **`exchange/`**；可用 **`--figures_dir <路径>`** 覆盖。
+- 若需强化 OT 通道损失，可加 **`--forecast_primary_loss_weight`**（如 `3`），**须重训**。
+
+---
+
+## 2026-04-30（续）：`exchange_rate` 多尺度日历 — `steps_per_day=1`
+
+### 问题
+
+- **`exchange_rate.csv` 为日频**（每行 = 1 个交易日）。原实现用 **`steps_per_day = 24 × steps_per_hour`**（与 ETTh「每小时一行」一致），等效把 **24 行**当成「池化语义上的一天」，**7 日 / 28 周**块跨度过长且与真实日历不符，会扭曲多尺度历史（含拼接尾段），加剧 **history 末段异常与 future 回落** 难以对齐的问题。
+
+### 改动
+
+| 文件 | 说明 |
+|------|------|
+| `utils/data_loader.py` | 新增 **`resolve_multiscale_steps_per_day`**：`exchange_rate` stem → **1**；**`_concat_multiscale_history` / `multiscale_window_start_min` / `WeatherWindowDataset`** 统一按 **`steps_per_day`**；日频下 **`hist_window_start_min=0`**（周池化仅需 28 行）。 |
+| `config/config.py` | **`multiscale_steps_per_day`**（`make_loaders` 回填）；`hist_window_start_min` 注释改为指向该字段。 |
+| `utils/trainer.py` | checkpoint **`meta`** 增加 **`multiscale_steps_per_day`**。 |
+| `main.py` | 启动时打印 **`multiscale_steps_per_day`**。 |
+
+### 其它数据
+
+- **ETTh / weather**：`steps_per_day=24`；**ETTm / wind**：`steps_per_day=96`。行为与修复前一致。
+
+### 兼容性
+
+- **在 `exchange_rate` 上须删除旧 checkpoint 并重训**：后 11 个多尺度 token 的数值分布已变，旧权重与新 conditioning 不匹配。
+
+- **零基础说明（多尺度日历、换数据集注意点）**：见 **`docs/multiscale_history_and_dataset_calendar.md`**。
+
+---
+
+## 2026-04-30：毕设 overlay 可选关闭竖移 `--thesis_overlay_no_anchor`
+
+### 目标
+
+- 默认 `plot_forecast_compare(..., anchor_forecast_boundary=True)` 仅在**图上**把各模型未来段**整体竖移**，使首点与 `hist[hist_anchor_index]` 对齐；**终端 MAE/MSE 始终用未平移预测**。
+- 若需「图上曲线与指标完全一致」或排查「是否竖移导致观感误解」，可 **`--thesis_overlay_no_anchor`** 关闭该平移。
+
+### 修改
+
+| 文件 | 说明 |
+|------|------|
+| `main.py` | 新增 CLI **`--thesis_overlay_no_anchor`**；毕设 `forecast_curves_overlay*` 调用传入 **`anchor_forecast_boundary=not args.thesis_overlay_no_anchor`**。 |
+
+---
+
+## 2026-04-30：多变量毕设指标全通道平均；图仍仅 OT（主变量）
+
+### 目标
+
+- **多输入多输出**：SimDiff、iTransformer、TimeMixer 仍为全通道预测。
+- **终端表与 `bar_mae_mse_*`**：MAE、MSE、CRPS、VAR（及 z 空间对应量）均为 **全测试集上对所有通道、(batch, horizon) 的平均**（与单变量时数值一致，C=1 时等同旧版单列）。
+- **`forecast_curves_overlay*`**：**仍只画主变量通道**（如 `OT`），与 `resolve_temperature_feature_index` 一致。
+
+### 实现
+
+| 文件 | 说明 |
+|------|------|
+| `main.py` | `evaluate_test_loader_prob_combined`：CRPS/VAR（及 z 版）对 **c=0…C−1** 累加后除以总元素数，等价于全通道平均；毕设横幅表/物理表/SimDiff 行用 **`mae_test`/`mse_test`**、`**mean(mae_ch_z)**`/`**mean(mse_ch_z)**`；基线改用 **`eval_forecasts_mse_mae`** 与 **`eval_forecasts_mse_mae_train_zscore`**；`plots/` 下 `bar_mae_mse` 与 `bar_mses` 同步为全通道平均；**ms_rms / 去噪器四组消融**表内 SimDiff 行改为 **`_mae_a`/`_mse_a`**（原 `_mse_a`/`_mae_a` 返回值语义不变）。 |
+| `utils/baselines.py` | 新增 **`eval_forecasts_mse_mae_train_zscore`**：逐点 `(pred−y)/σ_c` 后全通道全测试平均 MSE_z、MAE_z。 |
+
+### 用法
+
+与此前相同，例如：
+
+```bash
+python main.py --data_path data/exchange_rate.csv --all_features --eval_only
+```
+
+多变量时表头/脚注会标明 **all C ch mean**；overlay 仍单列主变量。

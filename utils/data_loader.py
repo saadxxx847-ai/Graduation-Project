@@ -21,7 +21,7 @@ def resolve_multiscale_steps_per_hour(cfg: Config, data_stem: str) -> int:
     显式 cfg.multiscale_steps_per_hour>0 时优先；否则：
     - 文件名含 ``ettm`` → 15min → 4；
     - ``wind``（本项目 ``data/wind.csv``，15min）→ 4；
-    其余为 1。
+    其余 stem → 1（**日频 `exchange_rate` 须在 `resolve_multiscale_steps_per_day` 中单独用 steps_per_day=1，勿与本字段混为「一日」宽度**）。
     """
     explicit = getattr(cfg, "multiscale_steps_per_hour", None)
     if explicit is not None and int(explicit) > 0:
@@ -34,14 +34,25 @@ def resolve_multiscale_steps_per_hour(cfg: Config, data_stem: str) -> int:
     return 1
 
 
-def multiscale_window_start_min(seq_len: int, steps_per_hour: int) -> int:
+def resolve_multiscale_steps_per_day(cfg: Config, data_stem: str) -> int:
+    """
+    多尺度池化里「一个日历日」对应多少行原始序列。
+    - ETTh（每小时一行）：24 × steps_per_hour = 24。
+    - ETTm / wind（15min）：24 × 4 = 96。
+    - **exchange_rate**（每行一日）：**1**（勿再用 24 行误当成一天，否则日/周聚合跨度过长且语义错误）。
+    """
+    if (data_stem or "").lower() == "exchange_rate":
+        return 1
+    sph = resolve_multiscale_steps_per_hour(cfg, data_stem)
+    return 24 * max(1, int(sph))
+
+
+def multiscale_window_start_min(seq_len: int, steps_per_day: int) -> int:
     """
     多尺度拼接需在 anchor=i+seq_len 左侧取完整「日池化窗 + 周池化窗」。
-    周池化回溯最长 → wmin = weekly_blk - seq_len。
-    hourly：weekly_blk=672 → wmin=576；15min：weekly_blk=2688 → wmin=2592。
+    周池化回溯最长 → wmin = weekly_blk - seq_len；weekly_blk = 28 × steps_per_day。
     """
-    sph = max(1, int(steps_per_hour))
-    spd = 24 * sph
+    spd = max(1, int(steps_per_day))
     weekly_blk = 28 * spd
     return max(0, int(weekly_blk) - int(seq_len))
 
@@ -50,17 +61,15 @@ def _concat_multiscale_history(
     data: np.ndarray,
     window_start: int,
     seq_len: int,
-    steps_per_hour: int = 1,
+    steps_per_day: int,
 ) -> np.ndarray:
     """
     拼接 [seq_len 原始步 | 7×日尺度平均 | 4×周尺度平均]，shape (seq_len+11, C)。
     window_start 为当前样本历史起点 i。
 
-    steps_per_hour=1（每小时一步）：与旧版一致——日窗 168=7×24 小时步，周窗 672=28×24。
-    steps_per_hour=4（15min）：日窗 672=7×96 步（仍 7 天），周窗 2688=28×96（仍 28 天）。
+    ``steps_per_day``：一行对应一个日历日的采样数（ETTh=24，ETTm=96，exchange_rate=1）。
     """
-    sph = max(1, int(steps_per_hour))
-    spd = 24 * sph  # steps per calendar day
+    spd = max(1, int(steps_per_day))
     daily_blk = 7 * spd
     weekly_blk = 28 * spd
     anchor = window_start + seq_len
@@ -100,19 +109,19 @@ class WeatherWindowDataset(Dataset):
         *,
         multiscale: bool = False,
         window_start_min: int = 0,
-        steps_per_hour: int = 1,
+        steps_per_day: int = 1,
     ):
         """
         data: (T, C) 全序列
         window_start_min: 允许的最早窗口起点索引 i（相对本段 data 下标 0）。
         multiscale: True 时历史为 seq_len+11 步拼接向量（仍为一通道标量每步）。
-        steps_per_hour: 仅 multiscale 时用；决定日/周池化回溯步数（见 _concat_multiscale_history）。
+        steps_per_day: 仅 multiscale 时用；一个日历日对应多少行（见 _concat_multiscale_history）。
         """
         self.data = data.astype(np.float32)
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.multiscale = bool(multiscale)
-        self.steps_per_hour = max(1, int(steps_per_hour))
+        self.steps_per_day = max(1, int(steps_per_day))
         self.window_start_min = int(window_start_min)
         self.n = len(data) - seq_len - pred_len + 1 - self.window_start_min
         if self.n <= 0:
@@ -129,7 +138,7 @@ class WeatherWindowDataset(Dataset):
         fut = self.data[i + self.seq_len : i + self.seq_len + self.pred_len]
         if self.multiscale:
             hist = _concat_multiscale_history(
-                self.data, i, self.seq_len, self.steps_per_hour
+                self.data, i, self.seq_len, self.steps_per_day
             )
         else:
             hist = self.data[i : i + self.seq_len]
@@ -190,9 +199,11 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
     ms = bool(getattr(cfg, "use_multiscale_hist", False))
     sph = resolve_multiscale_steps_per_hour(cfg, path.stem)
     cfg.multiscale_steps_per_hour = sph
+    spd = resolve_multiscale_steps_per_day(cfg, path.stem)
+    cfg.multiscale_steps_per_day = spd
     wmin = int(getattr(cfg, "hist_window_start_min", 0))
     if ms:
-        wmin = max(wmin, multiscale_window_start_min(cfg.seq_len, sph))
+        wmin = max(wmin, multiscale_window_start_min(cfg.seq_len, spd))
         cfg.hist_window_start_min = wmin
 
     train_end = int(T * cfg.train_ratio)
@@ -208,7 +219,7 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
         cfg.pred_len,
         multiscale=ms,
         window_start_min=wmin,
-        steps_per_hour=sph,
+        steps_per_day=spd,
     )
     val_ds = WeatherWindowDataset(
         val_mat,
@@ -216,7 +227,7 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
         cfg.pred_len,
         multiscale=ms,
         window_start_min=wmin,
-        steps_per_hour=sph,
+        steps_per_day=spd,
     )
     test_ds = WeatherWindowDataset(
         test_mat,
@@ -224,7 +235,7 @@ def make_loaders(cfg: Config) -> tuple[DataLoader, DataLoader, DataLoader, int, 
         cfg.pred_len,
         multiscale=ms,
         window_start_min=wmin,
-        steps_per_hour=sph,
+        steps_per_day=spd,
     )
 
     fut_mu, fut_sig = fit_future_marginal_stats(train_ds)

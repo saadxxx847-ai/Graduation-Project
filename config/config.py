@@ -40,10 +40,12 @@ class Config:
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # 滑动窗口起点 i 的最小值（相对各自划分后的序列）；用于与多尺度所需向左上下文对齐。
-    # 多尺度「向左看」长度取决于日历语义（见 multiscale_steps_per_hour）；make_loaders 内计算并写回本字段。
+    # 多尺度「向左看」长度取决于日历语义（见 multiscale_steps_per_day）；make_loaders 内计算并写回本字段。
     hist_window_start_min: int = 0
     # 多尺度池化的日历语义：每小时有多少个原始步（ETTh=1，ETTm 15min=4）。None 时在 make_loaders 中按文件名推断。
     multiscale_steps_per_hour: Optional[int] = None
+    # make_loaders 写入：「一个日历日」占多少行（ETTh=24，ETTm=96，exchange_rate=1）。多尺度日/周窗用此聚合。
+    multiscale_steps_per_day: Optional[int] = field(default=None, repr=False)
     # True：历史为 [seq_len 原始 | 7×日均值 | 4×周均值] 共 seq_len+11 步拼接（默认开；见 main --single_scale_hist 关闭）
     use_multiscale_hist: bool = True
 
@@ -204,10 +206,12 @@ class Config:
         return self.resolved_data_path().stem
 
     def resolved_result_dir(self) -> Path:
-        """毕设图表输出目录：`result/<slug>/`；`wind` 数据集单独使用项目根下 **`wind/`**（与用户约定一致）。"""
+        """毕设图表输出目录：`result/<slug>/`；`wind`→`wind/`，`exchange_rate`→`exchange/figures/`，与用户约定一致。"""
         slug = self.result_dataset_slug()
         if slug.lower() == "wind":
             p = self.project_root / "wind"
+        elif slug.lower() == "exchange_rate":
+            p = self.project_root / "exchange" / "figures"
         else:
             p = self.project_root / self.result_dir / slug
         p.mkdir(parents=True, exist_ok=True)

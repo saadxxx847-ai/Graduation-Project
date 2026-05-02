@@ -1,0 +1,2 @@
+exchange_rate 的毕设图（柱状图、forecast_curves_overlay 等）默认写入本目录。
+可用 --figures_dir 覆盖到其它路径；旧版曾直接写在上一级 exchange/ 根目录。

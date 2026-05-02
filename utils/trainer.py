@@ -48,6 +48,7 @@ def _config_to_meta(cfg: Config) -> dict:
         "input_dim": cfg.input_dim,
         "use_multiscale_hist": getattr(cfg, "use_multiscale_hist", False),
         "multiscale_steps_per_hour": getattr(cfg, "multiscale_steps_per_hour", None),
+        "multiscale_steps_per_day": getattr(cfg, "multiscale_steps_per_day", None),
         "hist_window_start_min": getattr(cfg, "hist_window_start_min", 0),
         "use_revin": cfg.use_revin,
         "use_hist_add_bias": getattr(cfg, "use_hist_add_bias", False),

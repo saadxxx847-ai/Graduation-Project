@@ -1,0 +1,2 @@
+exchange_rate 的毕设图默认写入子目录 figures/（与 Config.resolved_result_dir 一致）。
+本文件所在目录可保留历史 PNG；新运行产出入 exchange/figures/。

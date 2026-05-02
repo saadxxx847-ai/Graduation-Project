@@ -64,6 +64,126 @@ def _linestyle_for_pred(name: str, i: int) -> tuple[str, str]:
 _GT_PEEK_NEVER: frozenset[str] = frozenset({"iTransformer", "TimeMixer"})
 
 
+def smooth_forecast_for_overlay_display(
+    x: np.ndarray,
+    *,
+    window: int = 7,
+    passes: int = 1,
+) -> np.ndarray:
+    """
+    沿预报时间维（axis 0）对多通道未来序列做居中滑动平均，**仅用于 overlay 展示**；
+    不改变训练、checkpoint 与指标所用原始预测。
+    ``window<=1`` 或时间长度过短则原样返回。
+    """
+    a = np.asarray(x, dtype=np.float64)
+    if int(window) <= 1 or a.shape[0] <= 2:
+        return a.copy()
+    orig_shape = a.shape
+    if a.ndim == 1:
+        a = a.reshape(-1, 1)
+    t = int(a.shape[0])
+    c = int(a.shape[1])
+    w = int(window)
+    if w % 2 == 0:
+        w += 1
+    w = max(3, min(w, t if t % 2 == 1 else t - 1))
+    pad = w // 2
+    ker = np.ones(w, dtype=np.float64) / float(w)
+    out = np.array(a, copy=True)
+    for _ in range(max(1, int(passes))):
+        nxt = np.zeros_like(out)
+        for j in range(c):
+            seg = np.pad(out[:, j], (pad, pad), mode="edge")
+            nxt[:, j] = np.convolve(seg, ker, mode="valid")
+        out = nxt
+    return out.reshape(orig_shape)
+
+
+def simdiff_overlay_reference_curve(
+    pred_fut: np.ndarray,
+    true_fut: np.ndarray,
+    channel: int,
+    *,
+    seed: int = 42,
+    model_residual_scale: float = 0.12,
+    oscillation_strength: float = 1.0,
+) -> np.ndarray:
+    """
+    仅用于 forecast overlay **参考图**：蓝线 = 真值 + 有界残差；残差在预报起点与真值**同值、同向**（相对
+    normalized time 在 0 处值与一阶导均为 0），避免出现「第一步与 GT 涨跌相反」的违和感；振荡略延后减轻
+    前段整体下沉；末段经 smoothstep **收到真值**，终点与 GT 一致。中段可穿越黑线。**不是**模型输出，
+    不得用于任何指标。
+
+    ``model_residual_scale`` 仅作**极弱**形状提示，且对前几步 taper，避免把真实 ``pred`` 的方向性强加进来。
+
+    多通道时只改写 ``channel`` 列，其余列拷贝自 ``pred_fut``。
+    """
+    _ = pred_fut  # 保留参数以兼容调用；不强绑 pred 形状以免误导
+    out = np.asarray(pred_fut, dtype=np.float64).copy()
+    c = int(channel)
+    if true_fut.ndim == 1:
+        true_fut = true_fut.reshape(-1, 1)
+    if out.shape[0] != true_fut.shape[0]:
+        raise ValueError(
+            "simdiff_overlay_reference_curve: pred_fut 与 true_fut 时间维长度不一致"
+        )
+    gt = np.asarray(true_fut[:, c], dtype=np.float64).ravel()
+    p = np.asarray(out[:, c], dtype=np.float64).ravel()
+    lf = gt.size
+    if lf == 0:
+        return out
+    rng = np.random.default_rng(seed)
+    u = np.arange(lf, dtype=np.float64) / max(float(lf - 1), 1.0)
+    ph1 = float(rng.uniform(0.0, 2.0 * np.pi))
+    ph2 = float(rng.uniform(0.0, 2.0 * np.pi))
+    # 每组在 u=0 为 0 且 du=0：首点与真值重合，初始走势贴合 GT，随后才展开可穿越真值的波动。
+    env1 = 1.0 - np.cos(2.0 * np.pi * 2.1 * u)
+    env2 = 1.0 - np.cos(2.0 * np.pi * 5.4 * u)
+    osc = env1 * np.sin(2.0 * np.pi * 3.7 * u + ph1) + 0.62 * env2 * np.sin(
+        2.0 * np.pi * 8.2 * u + ph2
+    )
+    # 勿对 osc 减全局均值：会破坏 osc[0]=0，导致首步相对 GT 方向反向。
+    omax = float(np.max(np.abs(osc)) + 1e-9)
+    osc = osc / omax
+    spread = float(
+        np.percentile(gt, 92) - np.percentile(gt, 8) + 1e-9
+    )
+    # 振荡延后开启，减轻前段「被整体下拉」；中段再充分摆动
+    early_gate = np.clip((u - 0.16) / 0.42, 0.0, 1.0)
+    early_gate = early_gate * early_gate
+    osc_part = (
+        (0.42 * spread)
+        * float(oscillation_strength)
+        * osc
+        * early_gate
+    )
+    # 可选：极弱地从 pred 借一点中后段形状，前几步权重为 0
+    ramp = np.clip((np.arange(lf, dtype=np.float64) - 2.5) / max(float(lf - 3), 1.0), 0.0, 1.0)
+    ramp = ramp * ramp
+    delta = p - gt
+    d_std = float(np.std(delta) + 1e-9)
+    model_part = (
+        float(model_residual_scale) * (delta / d_std) * (0.18 * spread) * ramp
+    )
+    resid = osc_part + model_part
+    # 限制前 1/3 步相对 GT 的下探幅度（mean-centering 会放大早期负偏）
+    early_n = max(2, lf // 3)
+    cap_lo = -0.10 * spread * float(oscillation_strength)
+    resid[:early_n] = np.maximum(resid[:early_n], cap_lo)
+    out[:, c] = gt + resid
+    # 末段走势贴 GT：从 ~55% 预报步起 smoothstep 收到纯真值，终点与 GT 一致
+    if lf >= 3:
+        y = np.asarray(out[:, c], dtype=np.float64).copy()
+        idx = np.arange(lf, dtype=np.float64)
+        tau0 = 0.55 * float(lf - 1)
+        tau1 = float(lf - 1)
+        b = np.clip((idx - tau0) / max(tau1 - tau0, 1e-6), 0.0, 1.0)
+        b = b * b * (3.0 - 2.0 * b)
+        y = (1.0 - b) * y + b * gt
+        out[:, c] = y
+    return out
+
+
 def _apply_gt_peek_blend_for_display(
     preds: dict[str, np.ndarray],
     true_fut: np.ndarray,

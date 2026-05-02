@@ -108,7 +108,7 @@ flowchart LR
 ### 4.2 数据与控制形状
 
 - **`Config.effective_hist_len()`**：必须与 `WeatherWindowDataset` 输出的 `hist` 第一维长度一致，否则 Transformer 位置编码错位。
-- **多尺度与采样间隔**：`resolve_multiscale_steps_per_hour` 决定「一天多少步」（如 ETTh=1，ETTm / `wind`=4），进而决定日/周池化块长度；`hist_window_start_min` 保证每个窗口左侧有足够历史拼接池化段。
+- **多尺度与采样间隔**：`resolve_multiscale_steps_per_hour` 表示「**一小时内**几个采样点」；**「一个日历日在表里占几行」**由 **`resolve_multiscale_steps_per_day`** 决定（ETTh→24，ETTm/wind→96，**日频 `exchange_rate`→1**）。二者共同决定日/周池化块长度与 **`hist_window_start_min`**。零基础说明与换数据集注意点见 **`docs/multiscale_history_and_dataset_calendar.md`**。
 - **`BaselineHistTrim`**：基线只吃 `hist[:, :seq_len, :]`，与「SimDiff 用全长条件」对齐公平性说明（CLI 中会打印提示）。
 
 ### 4.3 训练目标 vs 终端 MAE

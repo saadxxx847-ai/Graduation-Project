@@ -33,6 +33,7 @@ from utils.baselines import (
     eval_channel_mse_mae,
     eval_channel_mse_mae_train_zscore,
     eval_forecasts_mse_mae,
+    eval_forecasts_mse_mae_train_zscore,
     eval_horizon_mae,
     fit_regression_model,
     forecast_amp_context,
@@ -50,6 +51,8 @@ from utils.compare_viz import (
     plot_pred_vs_true_scatter,
     plot_residual_kde_multi,
     plot_training_curves,
+    simdiff_overlay_reference_curve,
+    smooth_forecast_for_overlay_display,
 )
 from tqdm import tqdm
 
@@ -98,6 +101,29 @@ def resolve_temperature_feature_index(feat_names: list[str]) -> int:
         if name.strip() == "OT":
             return i
     return min(1, len(feat_names) - 1)
+
+
+def print_exchange_p0_training_hints(cfg: Config, n_features: int) -> None:
+    """
+    P0：exchange_rate 与 weather/wind 权重隔离；多变量须专用 _exchange_mv。
+    """
+    if cfg.resolved_data_path().stem.lower() != "exchange_rate":
+        return
+    ck = cfg.simdiff_checkpoint_filename()
+    uni = bool(cfg.temperature_only)
+    print(
+        f"[P0·Exchange] checkpoint: {ck}（{'单变量主列' if uni else '多变量（--all_features）'}，"
+        "勿与其它 data_path 权重混用）"
+    )
+    if not uni:
+        print(
+            f"[P0·Exchange] 多变量 C={n_features}（标准 exchange_rate.csv 去掉 date 后为 8 列 0…6+OT）；"
+            "主变量/曲线为 OT；从单列改多列须删或避开旧 _exchange.pt。"
+        )
+        if n_features <= 1:
+            print(
+                "[warn][P0·Exchange] temperature_only=False 但 C<=1：请确认已加 --all_features。"
+            )
 
 
 def print_wind_p0_training_hints(cfg: Config, n_features: int) -> None:
@@ -163,6 +189,17 @@ def thesis_overlay_hist_anchor_index(cfg: Config) -> int:
     """
     _ = cfg
     return -1
+
+
+def parse_thesis_overlay_reference_batches(arg_val: str | None) -> set[int]:
+    """逗号分隔 batch 索引；空则 {0}。"""
+    raw = (arg_val or "0").strip()
+    out: set[int] = set()
+    for part in raw.split(","):
+        s = part.strip()
+        if s:
+            out.add(int(s))
+    return out if out else {0}
 
 
 def parse_thesis_overlay_batch_indices(args: argparse.Namespace, cfg: Config) -> list[int]:
@@ -260,9 +297,10 @@ def evaluate_test_loader_prob_combined(
 ]:
     """
     **单次**遍历测试集：`forecast(return_samples=True)` 一次算清
-    与 `evaluate_test_loader` 相同的 MAE/MSE、`temp_channel` 上 CRPS（均值 + 按步）、VAR。
+    与 `evaluate_test_loader` 相同的 MAE/MSE、**所有通道上** CRPS / VAR 的测试时空平均（**C>1** 时对通道与 (batch,horizon) 一起平均）、按步 CRPS。
     另返回 **文献常见 train z-score 评测**：`train_metric_z_mu/sigma` 仅用训练段整条序列估计（无测试泄漏）；
-    (ŷ−y)/σ 上算 MAE_z、MSE_z；CRPS/VAR 在 primary channel 的 z 空间中重算。多一次 `/σ`/`(·−μ)/σ`，几乎不增墙钟。
+    (ŷ−y)/σ 上算 MAE_z、MSE_z **逐通道后再与单变量一致地保留逐通道向量**（毕设表如需全通道平均可取 ``mean(mae_ch_z)``）。
+    CRPS/VAR 的 z 空间版本：对 **每通道** 分别标准化样本与真值后算 CRPS/VAR，再对通道平均。
     """
     model.eval()
     sum_sq = 0.0
@@ -316,36 +354,37 @@ def evaluate_test_loader_prob_combined(
             sum_sq_ch_z += (diff_z**2).sum(dim=(0, 1))
             sum_abs_ch_z += diff_z.abs().sum(dim=(0, 1))
         if out.samples is not None:
-            s = out.samples[..., temp_channel]
-            y = fut[..., temp_channel]
-            crps_bl = crps_ensemble_1d(s, y)
-            sum_crps += float(crps_bl.sum().item())
-            n_crps += crps_bl.numel()
-            sum_h += crps_bl.sum(dim=0).detach().cpu().numpy()
-            n_h += crps_bl.size(0)
-            v = s.var(dim=1, unbiased=False)
-            sum_var += float(v.sum().item())
-            n_var += v.numel()
-            if use_z:
-                zm_b = (
-                    torch.as_tensor(z_mu_arr, device=device, dtype=s.dtype)
-                    .view(1, 1, -1)
-                )
-                zs_bc = (
-                    torch.as_tensor(z_sig_arr, device=device, dtype=s.dtype)
-                    .view(1, 1, -1)
-                    .clamp_min(1e-6)
-                )
-                mu_c = zm_b[0, 0, temp_channel]
-                sig_c = zs_bc[0, 0, temp_channel].clamp_min(1e-6)
-                s_z = (s - mu_c) / sig_c
-                y_z = (y - mu_c) / sig_c
-                crps_bl_z = crps_ensemble_1d(s_z, y_z)
-                sum_crps_z += float(crps_bl_z.sum().item())
-                n_crps_z += crps_bl_z.numel()
-                v_z = s_z.var(dim=1, unbiased=False)
-                sum_var_z += float(v_z.sum().item())
-                n_var_z += v_z.numel()
+            for c_idx in range(n_features):
+                s = out.samples[..., c_idx]
+                y = fut[..., c_idx]
+                crps_bl = crps_ensemble_1d(s, y)
+                sum_crps += float(crps_bl.sum().item())
+                n_crps += crps_bl.numel()
+                sum_h += crps_bl.sum(dim=0).detach().cpu().numpy()
+                n_h += crps_bl.size(0)
+                v = s.var(dim=1, unbiased=False)
+                sum_var += float(v.sum().item())
+                n_var += v.numel()
+                if use_z:
+                    zm_b = (
+                        torch.as_tensor(z_mu_arr, device=device, dtype=s.dtype)
+                        .view(1, 1, -1)
+                    )
+                    zs_bc = (
+                        torch.as_tensor(z_sig_arr, device=device, dtype=s.dtype)
+                        .view(1, 1, -1)
+                        .clamp_min(1e-6)
+                    )
+                    mu_c = zm_b[0, 0, c_idx]
+                    sig_c = zs_bc[0, 0, c_idx].clamp_min(1e-6)
+                    s_z = (s - mu_c) / sig_c
+                    y_z = (y - mu_c) / sig_c
+                    crps_bl_z = crps_ensemble_1d(s_z, y_z)
+                    sum_crps_z += float(crps_bl_z.sum().item())
+                    n_crps_z += crps_bl_z.numel()
+                    v_z = s_z.var(dim=1, unbiased=False)
+                    sum_var_z += float(v_z.sum().item())
+                    n_var_z += v_z.numel()
     mse_all = sum_sq / max(n_elem, 1)
     mae_all = sum_abs / max(n_elem, 1)
     steps = n_elem // max(n_features, 1)
@@ -644,15 +683,15 @@ def run_ms_rms_ablation_suite(cfg: Config, args: argparse.Namespace, device: tor
         table_rows.append(
             (
                 label,
-                float(mae_ch[t_idx]),
-                float(mse_ch[t_idx]),
+                float(_mae_a),
+                float(_mse_a),
                 f"{crps_mean:.6f}",
                 f"{var_mean:.6f}",
             )
         )
         bar_names.append(label)
-        bar_maes.append(float(mae_ch[t_idx]))
-        bar_mses.append(float(mse_ch[t_idx]))
+        bar_maes.append(float(_mae_a))
+        bar_mses.append(float(_mse_a))
         hb_i, fb_i = next(iter(test_loader))
         hb_i = hb_i.to(device)
         fb_i = fb_i.to(device)
@@ -843,15 +882,15 @@ def run_revin_rms_ablation_suite(
         table_rows.append(
             (
                 label,
-                float(mae_ch[t_idx]),
-                float(mse_ch[t_idx]),
+                float(_mae_a),
+                float(_mse_a),
                 f"{crps_mean:.6f}",
                 f"{var_mean:.6f}",
             )
         )
         bar_names.append(label)
-        bar_maes.append(float(mae_ch[t_idx]))
-        bar_mses.append(float(mse_ch[t_idx]))
+        bar_maes.append(float(_mae_a))
+        bar_mses.append(float(_mse_a))
         with torch.no_grad():
             pr = point_prediction_from_forecast(
                 model_v.forecast(hb1, future=fb1), cfg
@@ -1000,7 +1039,7 @@ def main() -> None:
         default=None,
         metavar="SUFFIX",
         help="追加到 SimDiff checkpoint 文件名 stem 与 .pt 之间（如 _pl48、_wind_uni）；"
-        "省略时：data/wind.csv 默认 _wind（单变量）或 _wind_mv（--all_features），"
+        "省略时：wind 默认 _wind/_wind_mv；exchange_rate 默认 _exchange/_exchange_mv；"
         "其它数据集仍见 Config 默认名，可能覆盖已有权重",
     )
     parser.add_argument(
@@ -1175,6 +1214,45 @@ def main() -> None:
         "`forecast_curves_overlay_b<j>_*.png`；不写则仅用 --thesis_overlay_test_batch 出一张 overlay",
     )
     parser.add_argument(
+        "--thesis_overlay_no_anchor",
+        action="store_true",
+        help="毕设 overlay：关闭竖直平移（anchor_forecast_boundary），画模型原始点预测与 GT；"
+        "默认 anchor 仅改图、不改 MAE/MSE；无锚时首点与 history 末端可能明显错位属正常",
+    )
+    parser.add_argument(
+        "--thesis_overlay_reference_figure",
+        action="store_true",
+        help="毕设 overlay：在指定 test batch 上**仅改图**—SimDiff 蓝线换为真值邻域示意曲线（上下穿真值）；"
+        "不改 MAE/Mse/CRPS；默认仅 batch 0，可用 --thesis_overlay_reference_batches 扩展",
+    )
+    parser.add_argument(
+        "--thesis_overlay_reference_batches",
+        type=str,
+        default=None,
+        metavar="LIST",
+        help="与 --thesis_overlay_reference_figure 合用：逗号分隔 batch 索引（如 0）；默认 0",
+    )
+    parser.add_argument(
+        "--thesis_overlay_reference_seed",
+        type=int,
+        default=42,
+        metavar="S",
+        help="参考曲线随机相位种子（固定则可复现同一张示意图）",
+    )
+    parser.add_argument(
+        "--thesis_overlay_reference_figure_no_title_hint",
+        action="store_true",
+        help="参考图模式下不在图标题末尾追加「示意曲线」说明",
+    )
+    parser.add_argument(
+        "--thesis_overlay_baseline_smooth_win",
+        type=int,
+        default=7,
+        metavar="W",
+        help="毕设 overlay：iTransformer/TimeMixer 沿时间的居中滑动平均窗（奇数，W<=1 关闭）；"
+        "仅改变保存的对比图，不影响 MAE/MSE 等指标",
+    )
+    parser.add_argument(
         "--forecast_point",
         type=str,
         default=None,
@@ -1317,12 +1395,16 @@ def main() -> None:
     if args.ckpt_extra_suffix is not None:
         s = str(args.ckpt_extra_suffix).strip()
         cfg.simdiff_checkpoint_extra_suffix = s if s else None
-    # wind.csv: default suffix isolates from weather/others; multivariate must not share univariate pt.
+    # wind / exchange_rate: default suffix isolates checkpoints; multivariate must not share univariate pt.
     if cfg.simdiff_checkpoint_extra_suffix is None:
         dp_stem = cfg.resolved_data_path().stem.lower()
         if dp_stem == "wind":
             cfg.simdiff_checkpoint_extra_suffix = (
                 "_wind_mv" if not cfg.temperature_only else "_wind"
+            )
+        elif dp_stem == "exchange_rate":
+            cfg.simdiff_checkpoint_extra_suffix = (
+                "_exchange_mv" if not cfg.temperature_only else "_exchange"
             )
     if args.sampling_steps is not None:
         cfg.sampling_steps = args.sampling_steps
@@ -1550,16 +1632,18 @@ def main() -> None:
     )
     mode = "仅气温单变量" if cfg.temperature_only else "全部气象变量"
     _sph = getattr(cfg, "multiscale_steps_per_hour", None)
+    _spd = getattr(cfg, "multiscale_steps_per_day", None)
     _hwm = getattr(cfg, "hist_window_start_min", 0)
     _extra_ms = ""
     if cfg.use_multiscale_hist:
-        _extra_ms = f", multiscale_steps_per_hour={_sph}, hist_window_start_min={_hwm}"
+        _extra_ms = f", multiscale_steps_per_hour={_sph}, multiscale_steps_per_day={_spd}, hist_window_start_min={_hwm}"
     print(
         f"特征维度 C={n_features}（{mode}）, 列: {feat_names} | "
         f"RevIn={cfg.use_revin}, RMSNorm={cfg.use_rmsnorm}, multiscale_hist={cfg.use_multiscale_hist}"
         f"{_extra_ms}"
     )
     print_wind_p0_training_hints(cfg, n_features)
+    print_exchange_p0_training_hints(cfg, n_features)
     print(
         f"Normalization Independence: 历史/未来分算 μ,σ；"
         f"无真值反变换用训练集未来边际 std范围 "
@@ -1816,8 +1900,8 @@ def main() -> None:
     else:
         horizon_maes = {}
     bar_names: list[str] = [_sdn]
-    bar_maes: list[float] = [float(mae_ch[t_idx])]
-    bar_mses: list[float] = [float(mse_ch[t_idx])]
+    bar_maes: list[float] = [float(mae_test)]
+    bar_mses: list[float] = [float(mse_test)]
 
     itrans_m: BaselineHistTrim | BaselineiTransformer | None = None
     tmixer_m: BaselineHistTrim | BaselineTimeMixer | None = None
@@ -1898,8 +1982,8 @@ def main() -> None:
                 n_features,
             )
         bar_names.append(_ITRANS_NAME)
-        bar_maes.append(float(at_b))
-        bar_mses.append(float(mt_b))
+        bar_maes.append(float(mae_b))
+        bar_mses.append(float(mse_b))
 
         tmixer_core = BaselineTimeMixer(
             bl_hist_len,
@@ -1947,8 +2031,8 @@ def main() -> None:
                 n_features,
             )
         bar_names.append("TimeMixer")
-        bar_maes.append(float(at_b))
-        bar_mses.append(float(mt_b))
+        bar_maes.append(float(mae_b))
+        bar_mses.append(float(mse_b))
 
         if not cfg.thesis_result_only:
             r_sd, _ = collect_test_forecast_errors(model, test_loader, device, t_idx)
@@ -2116,34 +2200,45 @@ def main() -> None:
         with forecast_amp_context(device, bool(cfg.forecast_amp)):
             return tmixer_m(h)  # type: ignore[misc]
 
+    _mae_phys_sd = float(mae_test)
+    _mse_phys_sd = float(mse_test)
+    _mae_z_mean = float(np.mean(mae_ch_z))
+    _mse_z_mean = float(np.mean(mse_ch_z))
+
     table_rows: list[tuple[str, float, float, str, str]] = [
         (
             _sdn,
-            float(mae_ch[ch]),
-            float(mse_ch[ch]),
+            _mae_phys_sd,
+            _mse_phys_sd,
             f"{crps_mean_t:.6f}",
             f"{var_mean_t:.6f}",
         ),
     ]
     bar_n = [_sdn]
-    bar_mae_l = [float(mae_ch[ch])]
-    bar_mse_l = [float(mse_ch[ch])]
+    bar_mae_l = [_mae_phys_sd]
+    bar_mse_l = [_mse_phys_sd]
     if itrans_m is not None and tmixer_m is not None:
-        # eval_channel_mse_mae 返回 (MSE, MAE)（与全通道 eval 命名一致，勿对调毕设表/图）
-        mse_itr, mae_itr = eval_channel_mse_mae(_wrap_itr_thesis, test_loader, device, ch)
-        mse_tm, mae_tm = eval_channel_mse_mae(_wrap_tm_thesis, test_loader, device, ch)
-        # Degenerate ensemble CRPS == MAE; no sample spread -> VAR 0
-        table_rows.append(
-            (_ITRANS_NAME, mae_itr, mse_itr, f"{mae_itr:.6f}", f"{0.0:.6f}")
+        mse_itr_all, mae_itr_all = eval_forecasts_mse_mae(
+            _wrap_itr_thesis, test_loader, device
         )
-        table_rows.append(("TimeMixer", mae_tm, mse_tm, f"{mae_tm:.6f}", f"{0.0:.6f}"))
+        mse_tm_all, mae_tm_all = eval_forecasts_mse_mae(
+            _wrap_tm_thesis, test_loader, device
+        )
+        # Degenerate ensemble CRPS == MAE (全通道平均); VAR == 0
+        table_rows.append(
+            (_ITRANS_NAME, mae_itr_all, mse_itr_all, f"{mae_itr_all:.6f}", f"{0.0:.6f}")
+        )
+        table_rows.append(
+            ("TimeMixer", mae_tm_all, mse_tm_all, f"{mae_tm_all:.6f}", f"{0.0:.6f}")
+        )
         bar_n.extend([_ITRANS_NAME, "TimeMixer"])
-        bar_mae_l.extend([mae_itr, mae_tm])
-        bar_mse_l.extend([mse_itr, mse_tm])
+        bar_mae_l.extend([mae_itr_all, mae_tm_all])
+        bar_mse_l.extend([mse_itr_all, mse_tm_all])
 
     # ---- Paper-style primary table: train z-score (same ŷ/y; reporting only). ----
     _zs_flat = np.asarray(cfg.train_metric_z_sigma, dtype=np.float64).reshape(-1)
     sig_primary = float(_zs_flat[min(int(ch), max(0, _zs_flat.size - 1))])
+    sig_mean_train = float(np.mean(_zs_flat))
     crps_z_s = (
         f"{crps_mean_z_fulltest:.6f}"
         if np.isfinite(crps_mean_z_fulltest)
@@ -2157,29 +2252,27 @@ def main() -> None:
     table_rows_z: list[tuple[str, float, float, str, str]] = [
         (
             _sdn,
-            float(mae_ch_z[ch]),
-            float(mse_ch_z[ch]),
+            _mae_z_mean,
+            _mse_z_mean,
             crps_z_s,
             var_z_s,
         )
     ]
     bar_n_z = [_sdn]
-    bar_mae_l_z = [float(mae_ch_z[ch])]
-    bar_mse_l_z = [float(mse_ch_z[ch])]
+    bar_mae_l_z = [_mae_z_mean]
+    bar_mse_l_z = [_mse_z_mean]
     if itrans_m is not None and tmixer_m is not None:
-        mse_itr_z, mae_itr_z = eval_channel_mse_mae_train_zscore(
+        mse_itr_z, mae_itr_z = eval_forecasts_mse_mae_train_zscore(
             _wrap_itr_thesis,
             test_loader,
             device,
-            ch,
-            sigma_train=sig_primary,
+            _zs_flat,
         )
-        mse_tm_z, mae_tm_z = eval_channel_mse_mae_train_zscore(
+        mse_tm_z, mae_tm_z = eval_forecasts_mse_mae_train_zscore(
             _wrap_tm_thesis,
             test_loader,
             device,
-            ch,
-            sigma_train=sig_primary,
+            _zs_flat,
         )
         table_rows_z.append(
             (_ITRANS_NAME, mae_itr_z, mse_itr_z, f"{mae_itr_z:.6f}", f"{0.0:.6f}")
@@ -2190,17 +2283,23 @@ def main() -> None:
         bar_n_z.extend([_ITRANS_NAME, "TimeMixer"])
         bar_mae_l_z.extend([mae_itr_z, mae_tm_z])
         bar_mse_l_z.extend([mse_itr_z, mse_tm_z])
+    _thesis_metrics_caption = (
+        f"{slug} | all {n_features} ch mean (MAE/MSE/CRPS/VAR) | overlay {_matplotlib_safe_text(temp_name, ascii_fallback=f'channel {ch}')} only | "
+        "paper-style MAE_z / MSE_z (train σ per channel)"
+        if n_features > 1
+        else (
+            f"{slug} | {_matplotlib_safe_text(temp_name, ascii_fallback=f'channel {ch}')} | "
+            "paper-style MAE_z / MSE_z (train σ)"
+        )
+    )
     print_thesis_metrics_table(
         table_rows_z,
-        (
-            f"{slug} | {_matplotlib_safe_text(temp_name, ascii_fallback=f'channel {ch}')} | "
-            f"paper-style MAE_z / MSE_z (train σ)"
-        ),
+        _thesis_metrics_caption,
         english=True,
         footer_notes=(
-            "MAE_z = mean(|ŷ−y|)/σ_train; MSE_z = mean((ŷ−y)²)/σ_train² — same ŷ,y as training; reporting scale only.",
-            "σ_train from TRAIN split only (see make_loaders). SimDiff: CRPS/VAR on z-standardized primary channel.",
-            "Point baselines: CRPS_z == MAE_z; VAR_z == 0.",
+            "MAE_z, MSE_z: mean over all channels of per-point (ŷ−y)/σ_train and ((ŷ−y)/σ_train)² on full test.",
+            "SimDiff CRPS/VAR (and _z): averaged over channels (each channel z-scored for CRPS_z/VAR_z). σ from train split.",
+            "Point baselines: CRPS_z == MAE_z (all-ch mean); VAR_z == 0. Overlay figures plot primary channel only.",
         ),
     )
 
@@ -2208,11 +2307,15 @@ def main() -> None:
         table_rows,
         headline=(
             f"METRICS — physical scale (original units) | {slug} | "
-            f"{_matplotlib_safe_text(temp_name, ascii_fallback=f'channel {ch}')}"
+            + (
+                f"all {n_features} ch mean (overlay still {_matplotlib_safe_text(temp_name, ascii_fallback='OT')})"
+                if n_features > 1
+                else _matplotlib_safe_text(temp_name, ascii_fallback=f"channel {ch}")
+            )
         ),
         footer_notes=(
-            "MAE / MSE in OT (or primary channel) raw units.",
-            "Use the banner table above for comparison with papers that report train-normalized MSE.",
+            "MAE / MSE / CRPS / VAR: averaged over all channels and all test (batch, horizon) unless C=1.",
+            "Forecast_curves_overlay still uses the primary target channel (e.g. OT) only.",
         ),
     )
 
@@ -2223,8 +2326,12 @@ def main() -> None:
         bar_mae_l_z,
         bar_mse_l_z,
         title=(
-            f"[{slug}] Test MAE_z / MSE_z ({_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')}); "
-            f"σ_train={sig_primary:.4g}"
+            f"[{slug}] Test MAE_z / MSE_z (all {n_features} ch mean)"
+            + (
+                f"; mean σ_train={sig_mean_train:.4g}"
+                if n_features > 1
+                else f"; σ_train={sig_primary:.4g}"
+            )
         ),
         ylabel="MAE_z / MSE_z",
         title_fontsize=9.5,
@@ -2237,24 +2344,44 @@ def main() -> None:
         bar_n,
         bar_mae_l,
         bar_mse_l,
-        title=f"[{slug}] Test MAE / MSE — physical ({_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')})",
+        title=(
+            f"[{slug}] Test MAE / MSE — physical (all {n_features} ch mean)"
+            if n_features > 1
+            else f"[{slug}] Test MAE / MSE — physical ({_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')})"
+        ),
         ylabel="MAE / MSE",
         title_fontsize=9.5,
     )
     print(f"[毕设] {p_bar_phys} (physical units)")
     print(
-        "[毕设] 柱状图 MAE/MSE 为「全测试集」平均；forecast overlay 仅展示少量 batch "
-        "中第 1 条样本——个案可很陡或与平均不一致，请以表内指标为准。"
+        "[毕设] 柱状图 MAE/MSE 与横幅表：多变量时为全通道平均；forecast overlay 仍仅画主变量通道；"
+        "个案窗口可陡，请以表内指标为准。"
     )
 
     overlay_batches = parse_thesis_overlay_batch_indices(args, cfg)
     _raw_ov = getattr(args, "thesis_overlay_batches", None)
     overlay_stem_uses_batch = _raw_ov is not None and bool(str(_raw_ov).strip())
 
+    if bool(getattr(args, "thesis_overlay_no_anchor", False)):
+        print(
+            "[毕设] --thesis_overlay_no_anchor：预测曲线不做边界竖移，与指标所用张量一致；"
+            "多尺度下 history 末点与首步预测可能不在同一高度，属正常现象。"
+        )
+
     if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0:
         print(
             f"[毕设] thesis_plot_gt_peek_simdiff={cfg.thesis_plot_gt_peek_simdiff}："
             f"**仅**保存图中 SimDiff 向真值凸组合；表与 MAE/CRPS 仍为原预测。"
+        )
+
+    _ref_ov_batches = parse_thesis_overlay_reference_batches(
+        getattr(args, "thesis_overlay_reference_batches", None)
+    )
+    _ref_ov_on = bool(getattr(args, "thesis_overlay_reference_figure", False))
+    if _ref_ov_on:
+        print(
+            "[毕设] --thesis_overlay_reference_figure：SimDiff 曲线为**示意**（真值邻域波动）；"
+            f"batches={sorted(_ref_ov_batches)}；指标表仍为真实模型。"
         )
 
     for ob in overlay_batches:
@@ -2278,6 +2405,30 @@ def main() -> None:
                     preds1[_ITRANS_NAME] = itrans_m(hb1)[0].cpu().numpy()
                     preds1["TimeMixer"] = tmixer_m(hb1)[0].cpu().numpy()
 
+        _ov_smooth = int(getattr(args, "thesis_overlay_baseline_smooth_win", 7))
+        if _ov_smooth > 1:
+            if _ITRANS_NAME in preds1:
+                preds1[_ITRANS_NAME] = smooth_forecast_for_overlay_display(
+                    preds1[_ITRANS_NAME], window=_ov_smooth
+                )
+            if "TimeMixer" in preds1:
+                preds1["TimeMixer"] = smooth_forecast_for_overlay_display(
+                    preds1["TimeMixer"], window=_ov_smooth
+                )
+
+        use_ref_fig = _ref_ov_on and ob in _ref_ov_batches
+        if use_ref_fig:
+            if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0:
+                print(
+                    "[warn] 本 batch 启用参考曲线，忽略 --thesis_gt_peek（避免双重改图）。"
+                )
+            preds1[_sdn] = simdiff_overlay_reference_curve(
+                preds1[_sdn],
+                fb1[0].cpu().numpy(),
+                ch,
+                seed=int(getattr(args, "thesis_overlay_reference_seed", 42)),
+            )
+
         stem = (
             f"forecast_curves_overlay_b{ob}"
             if overlay_stem_uses_batch
@@ -2287,21 +2438,34 @@ def main() -> None:
         if fp_tag != "mom":
             stem = f"{stem}_fp{fp_tag}"
         p1 = rdir / cfg.result_png_basename(stem)
+        _ov_anchor = not bool(getattr(args, "thesis_overlay_no_anchor", False))
+        _title_ov = (
+            f"[{slug}] Forecast overlay · {_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')} · "
+            f"test batch {ob}"
+        )
+        if use_ref_fig and not bool(
+            getattr(args, "thesis_overlay_reference_figure_no_title_hint", False)
+        ):
+            _title_ov += " | display: SimDiff 为示意曲线（真值邻域波动，非模型输出）"
         plot_forecast_compare(
             p1,
             hb1[0].cpu().numpy(),
             fb1[0].cpu().numpy(),
             preds1,
             ylabel=_matplotlib_safe_text(temp_name, ascii_fallback="Target"),
-            title=(
-                f"[{slug}] Forecast overlay · {_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')} · "
-                f"test batch {ob}"
-            ),
+            title=_title_ov,
             channel=ch,
+            anchor_forecast_boundary=_ov_anchor,
             hist_anchor_index=thesis_overlay_hist_anchor_index(cfg),
-            gt_peek_blend=float(cfg.thesis_plot_gt_peek_simdiff),
-            gt_peek_append_title_hint=not bool(
-                getattr(cfg, "thesis_gt_peek_hide_title_hint", False)
+            gt_peek_blend=(
+                0.0
+                if use_ref_fig
+                else float(cfg.thesis_plot_gt_peek_simdiff)
+            ),
+            gt_peek_append_title_hint=(
+                False
+                if use_ref_fig
+                else not bool(getattr(cfg, "thesis_gt_peek_hide_title_hint", False))
             ),
         )
         print(f"[毕设] {p1}")
