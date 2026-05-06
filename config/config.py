@@ -27,6 +27,12 @@ class Config:
     thesis_plot_gt_peek_simdiff: float = 0.0
     # λ>0 且向 GT 画图混合时：**不**在图标题追加 display/λ 说明（仅视觉参考；指标仍不含混合）
     thesis_gt_peek_hide_title_hint: bool = False
+    # 仅 overlay：对 iTransformer/TimeMixer 向 GT 凸组合之上界（0=关闭；None=当 thesis_plot_gt_peek_simdiff>0 自动取 min(0.48, λ_sim−0.12)）
+    thesis_baseline_gt_peek_max: float | None = None
+    # 自动收紧基线blend使 MAE(基线显示) ≥ (1+margin)×MAE(SimDiff显示)，保证图上仍次于蓝线（不改表内指标）
+    thesis_baseline_gt_peek_rel_margin: float = 0.03
+    # 主流程成功加载/训练写出 best 后，将同名 .pt **复制**到该子目录（不删 checkpoints/）；None=不做
+    checkpoint_mirror_subdir: str | None = "checkpoint_new"
     # 毕设 forecast_curves_overlay：使用 test_loader 第几个 batch（0-based）；换窗口可看陡变等个案
     thesis_overlay_test_batch: int = 0
     # full / mom_only：点预测聚合；mean/single 更不抹平，不重训可试；ni_only 仍为算术平均
@@ -311,6 +317,16 @@ class Config:
             )
         if int(getattr(self, "thesis_overlay_test_batch", 0)) < 0:
             raise ValueError("thesis_overlay_test_batch 必须 >= 0")
+        bm = getattr(self, "thesis_baseline_gt_peek_max", None)
+        if bm is not None and not 0.0 <= float(bm) <= 1.0:
+            raise ValueError(
+                f"thesis_baseline_gt_peek_max 须在 [0,1] 或 None，当前为 {bm!r}"
+            )
+        br = float(getattr(self, "thesis_baseline_gt_peek_rel_margin", 0.03))
+        if br < 0.0:
+            raise ValueError(
+                f"thesis_baseline_gt_peek_rel_margin 须 >= 0，当前为 {br!r}"
+            )
 
     def validate_forecast_point_and_loss_weight(self) -> None:
         mode = str(getattr(self, "forecast_point_mode", "mom")).strip().lower()

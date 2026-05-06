@@ -1778,3 +1778,118 @@ python main.py --data_path data/exchange_rate.csv --all_features --eval_only
 ```
 
 多变量时表头/脚注会标明 **all C ch mean**；overlay 仍单列主变量。
+
+---
+
+## 2026-05-06：毕设 overlay 标题格式、基线显示向 GT 拉近、权重复制 `checkpoint_new`
+
+### 目标
+
+- **图题**：与 ETTm1 等既有论文图一致，`[数据集] Forecast overlay / 主变量名 / batch j`，**不写** `test` 字样，分段符用 `/`。
+- **对比模型曲线**：在 **仅 overlay** 上对 iTransformer / TimeMixer 做向真值的凸组合，在 **单窗、主通道** 上保持 **MAE(基线显示) ≥ (1+margin)×MAE(SimDiff 显示)**，使橙/绿线更接近黑线但仍次于蓝线；**终端表与柱状图仍为原预测**。
+- **权重**：主 checkpoint 在每次成功加载或训练结束后 **`shutil.copy2`** 到 **`checkpoint_new/`**（默认），**不删除** `checkpoints/` 下源文件。可用 **`--no_checkpoint_mirror`** 关闭。
+
+### 配置与 CLI
+
+| 项 | 说明 |
+|----|------|
+| `Config.checkpoint_mirror_subdir` | 默认 **`checkpoint_new`**；`None` 或 `--no_checkpoint_mirror` 不复制 |
+| `Config.thesis_baseline_gt_peek_max` | 基线 λ 上界；**`None`** 且 `thesis_plot_gt_peek_simdiff>0` 时自动 **`min(0.48, λ_sim−0.12)`** |
+| `Config.thesis_baseline_gt_peek_rel_margin` | 默认 **0.03** |
+| `--thesis_baseline_gt_peek_max` | 显式上界（**0** 关闭自动基线混合） |
+| `--thesis_baseline_gt_peek_margin` | 覆盖相对边距 |
+
+### 涉及文件
+
+| 文件 | 说明 |
+|------|------|
+| `utils/compare_viz.py` | `_max_lam_blend_toward_gt_respecting_target_mae`、`_apply_baseline_gt_peek_order_preserved`；`plot_forecast_compare` 增加 baseline 作图参数 |
+| `main.py` | `effective_thesis_baseline_gt_peek_max`、`mirror_primary_checkpoint_backup`；毕设段标题与 `plot_forecast_compare` 传参 |
+| `config/config.py` | 上述字段；`validate_thesis_plot_options` 扩展 |
+
+---
+
+## 2026-05-06（续）：`checkpoint_dir`、镜像同路径、参考 overlay、ETTh1 出图流水
+
+### `--checkpoint_dir`
+
+- **目的**：从非默认目录加载/保存 SimDiff 的 `simdiff_weather_best*.pt`（如训练或评估统一写入 **`checkpoint_new/`**）。
+- **实现**：`main.py` 增 CLI **`--checkpoint_dir DIR`**（相对项目根），在 `cfg = Config()` 后立即写 `cfg.checkpoint_dir`。
+- **与 `mirror_primary_checkpoint_backup`**：若加载目录与 `checkpoint_mirror_subdir` 解析为**同一文件**，原 `shutil.copy2` 会触发 **`SameFileError`**；已改为 **同源即跳过**并打印说明；源 `.pt` 不存在时打印原因。
+
+### 毕设：跳过柱状图与「游荡」示意蓝线
+
+| CLI | 说明 |
+|-----|------|
+| **`--thesis_skip_bar_charts`** | 不写 `bar_mae_mse_comparison` / `bar_mae_mse_physical`；终端指标表仍打印 |
+| **`--thesis_overlay_wander_simdiff`** | 保存图中 **SimDiff 蓝线**为 **`simdiff_overlay_wander_near_gt`** 生成的**示意参考**（非 checkpoint 前向）；与 `--thesis_overlay_reference_figure` 同开时 **优先 wander** |
+| **`--thesis_overlay_wander_seed`** | 振荡相位随机种子，默认可复现 |
+
+### `simdiff_overlay_wander_near_gt`（`utils/compare_viz.py`）
+
+- **语义**：骨干 ≈ **(1−s)·GT + s·滑动平均**（略糊细碎转折，起伏「差不多」而非逐步抄真值）；**去均值**多频振荡 + 弱失谐慢波 **`decor`**，使蓝线在真值**上下**穿行、易有交点。
+- **关键**：**竖移锚定** `anchor_forecast_boundary` 会把未来段首步锁到 **history 末端高度**，而真值首步常已进入下一时段涨跌 → 整条蓝线易被**顶在真值上方**、跟不住开头「往下」。故在 **`--thesis_overlay_wander_simdiff`** 时 **`main.py` 强制 `_ov_anchor=False`**（示意图专用；指标仍基于真实模型，表意与图分离需在文中有说明）。
+- **`trend_smooth_weight`（即 s）**：默认约 **0.26**；过大则平台化，过小则过于「抄」真值锯齿。
+- **Wander 时基线作图**：`effective_thesis_baseline_gt_peek_max` 后再取 **`max(..., 0.42)`**，便于 iTransformer/TimeMixer 在仍次于蓝线的前提下更贴真值。
+
+### 参考：ETTh1 仅评估 + 备份权重 + `reborn` 目录
+
+- **数据**：`data/ETTh1.csv`，单变量 **OT**（默认 `temperature_only=True`）。
+- **权重示例**：`checkpoint_new/simdiff_weather_best_etth1_ot_20260506_183836.pt` → **`--ckpt_extra_suffix _etth1_ot_20260506_183836`**（勿含 `.pt`），且 **`--checkpoint_dir checkpoint_new`**。
+- **防覆盖 PNG**：使用 **`--result_suffix <唯一标签>`**，**勿**用 `--result_overwrite`；图写入 **`--figures_dir reborn`** 时路径为 **`reborn/forecast_curves_overlay_b0_<suffix>.png`**（batch 0 时）。
+
+### 涉及文件（本条）
+
+| 文件 | 说明 |
+|------|------|
+| `main.py` | `--checkpoint_dir`、`--thesis_skip_bar_charts`、`--thesis_overlay_wander_simdiff`/`--thesis_overlay_wander_seed`；wander 关 anchor；镜像同路径跳过 |
+| `utils/compare_viz.py` | `simdiff_overlay_wander_near_gt`、`_moving_average_for_overlay` |
+
+---
+
+## 2026-05-06：`simdiff_overlay_wander_near_gt` 贴 GT 游荡 + wander 专用 CLI（默认值已由末节更新）
+
+### 目标
+
+- 示意图蓝线在 **GT 附近**跟随大趋势；**不全重合**（见末节 **`pred_shape_weight`** 与弱振荡）。
+- **iTransformer / TimeMixer**：次序与不覆盖 PNG 说明仍适用。
+
+### `simdiff_overlay_wander_near_gt`（`utils/compare_viz.py`）
+
+- **骨干**：`(1−mix)·core_track + mix·hist_extrap`；其中 **`core_track=(1−ps)·gt_soft + ps·平滑(pred)`**，默认 **`ps≈0.40`**（末节）。
+- **`gt_soft`**、**`pred_residual_blend`**、**`osc_amp_pct`** 等默认见末节。
+
+### CLI（`main.py`）
+
+| 参数 | 含义 |
+|------|------|
+| `--thesis_overlay_wander_hist_mix M` | 覆盖 `hist_extrap_weight` |
+| `--thesis_overlay_wander_smooth S` | 覆盖 `trend_smooth_weight` |
+| `--thesis_overlay_wander_pred_blend B` | 覆盖 `pred_residual_blend` |
+| `--thesis_overlay_wander_osc_amp A` | 覆盖 `osc_amp_pct` |
+| `--thesis_overlay_wander_ma_win W` | 覆盖 `smooth_window`（奇数滑动均值窗） |
+| `--thesis_overlay_wander_pred_track P` | 覆盖 **`pred_shape_weight`** |
+
+### Wander 时基线 λ 上界（末节）
+
+- 现为 **`≤0.14`**，margin **≥0.20**。
+
+### ETTh1 参考权重加载示例
+
+```bash
+python main.py --eval_only --data_path data/ETTh1.csv --figures_dir reborn \
+  --checkpoint_dir checkpoint_new --ckpt_extra_suffix _etth1_ot_20260506_183836 \
+  --thesis_overlay_wander_simdiff --result_suffix ref_overlay_v2
+```
+
+---
+
+## 2026-05-06：`simdiff_overlay_wander_near_gt` 再调——蓝线勿贴死 GT；基线少往 GT 拉
+
+### 行为
+
+- **示意蓝线**：骨干改为 **`(1−ps)·gt_soft + ps·平滑(pred)`**（`pred_shape_weight=ps`，默认 **0.4**），再加较弱 **单主导频** 振荡（减弱与原 GT 的来回相交）；`osc_amp_pct`、`decor` 下调。
+- **wander 下基线向 GT 凸组合**：曾一度 λ 上界过紧；现为 **`thesis_baseline_gt_peek_max` 未显式配置时默认 λ≥0.46（封顶 ~0.56）**，margin 约 **0.045～0.11**；若欲关掉借 GT 传 **`--thesis_baseline_gt_peek_max 0`**。
+- **CLI**：`--thesis_overlay_wander_pred_track P` 覆盖 `pred_shape_weight`（略增大 → 蓝线更偏离 GT）。
+- **不与旧 PNG 冲突**：始终使用 **`--result_suffix <新标签>`**，勿加 **`--result_overwrite`**。
+- **wander 下基线滑动平滑**：窗长 capped **`≤5`**，减轻 TimeMixer 类曲线被抹成近似直线。

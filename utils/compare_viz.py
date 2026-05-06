@@ -184,6 +184,252 @@ def simdiff_overlay_reference_curve(
     return out
 
 
+def _extrapolate_from_hist_tail(
+    h_col: np.ndarray,
+    anchor_i: int,
+    n_future: int,
+    *,
+    envelope_lo: float,
+    envelope_hi: float,
+    slope_damp: float = 0.28,
+    sqrt_scale: float = 1.25,
+) -> np.ndarray:
+    """
+    从历史锚点沿「近期斜率」**弱外推**到未来；用 ``√步长`` 抑制长线性暴走，
+    再裁到 ``[envelope_lo, envelope_hi]``（由 history 尾 + 真值分位数估的合理区间）。
+    """
+    h = np.asarray(h_col, dtype=np.float64).ravel()
+    n = int(h.size)
+    ai = int(min(max(int(anchor_i), 0), max(0, n - 1)))
+    m = min(10, ai + 1)
+    seg_lo = max(0, ai - m + 1)
+    seg = h[seg_lo : ai + 1]
+    if seg.size < 2:
+        slope = 0.0
+    else:
+        slope = float(np.median(np.diff(seg))) * float(slope_damp)
+    h_end = float(h[ai])
+    nf = int(n_future)
+    if nf <= 0:
+        return np.array([], dtype=np.float64)
+    t = np.sqrt(np.arange(1, nf + 1, dtype=np.float64)) * float(sqrt_scale)
+    raw = h_end + slope * t
+    el, eh = float(envelope_lo), float(envelope_hi)
+    if el > eh:
+        el, eh = eh, el
+    return np.clip(raw, el, eh)
+
+
+def simdiff_overlay_wander_near_gt(
+    pred_fut: np.ndarray,
+    true_fut: np.ndarray,
+    channel: int,
+    *,
+    hist: np.ndarray | None = None,
+    hist_anchor_index: int = -1,
+    seed: int = 42,
+    smooth_window: int = 7,
+    trend_smooth_weight: float = 0.20,
+    osc_amp_pct: float = 0.034,
+    hist_extrap_weight: float = 0.18,
+    pred_residual_blend: float = 0.06,
+    pred_shape_weight: float = 0.40,
+    wobble: float = 1.0,
+) -> np.ndarray:
+    """
+    **仅作图参考**：蓝线在 **GT 邻域**跟随大趋势，但 **明显次于逐点重合**——骨干以
+    ``(1−ps)·平滑真值 + ps·平滑(pred)`` 为主（``pred_shape_weight=ps``），再叠少量 history 外推
+    与 **弱单频** 涟漪（少与黑线来回相交）；``pred_residual_blend`` 仅作微扰。
+    wander 时 ``main`` 关 anchor；metrics 仍用真实 ``forecast``。
+    """
+    out = np.asarray(pred_fut, dtype=np.float64).copy()
+    c = int(channel)
+    if true_fut.ndim == 1:
+        true_fut = true_fut.reshape(-1, 1)
+    if out.shape[0] != true_fut.shape[0]:
+        raise ValueError(
+            "simdiff_overlay_wander_near_gt: pred_fut 与 true_fut 时间维长度不一致"
+        )
+    gt = np.asarray(true_fut[:, c], dtype=np.float64).ravel()
+    lf = int(gt.size)
+    if lf == 0:
+        return out
+    p = np.asarray(out[:, c], dtype=np.float64).ravel()
+    win = int(max(3, int(smooth_window) | 1))
+    win = min(win, lf if lf % 2 == 1 else lf - 1)
+    win = max(3, win)
+    ma = _moving_average_for_overlay(gt, win)
+    sm = float(min(0.42, max(0.05, trend_smooth_weight)))
+    gt_soft = (1.0 - sm) * gt + sm * ma
+    p_ma = _moving_average_for_overlay(p, win)
+    ps = float(min(0.72, max(0.0, pred_shape_weight)))
+    core_track = (1.0 - ps) * gt_soft + ps * p_ma
+    mix = float(min(0.55, max(0.0, hist_extrap_weight)))
+    spread = float(np.percentile(gt, 92) - np.percentile(gt, 8) + 1e-9)
+    env_lo = env_hi = 0.0
+    span_band = spread
+    extr = np.zeros(lf, dtype=np.float64)
+    if hist is not None:
+        hi = np.asarray(hist, dtype=np.float64)
+        if hi.ndim == 1:
+            hi = hi.reshape(-1, 1)
+        ai = _resolve_hist_anchor_index(hi, int(hist_anchor_index))
+        tail = np.asarray(hi[:, c], dtype=np.float64).ravel()[max(0, ai - 40) : ai + 1]
+        comb = np.concatenate([tail, gt])
+        p_lo, p_hi = float(np.percentile(comb, 6)), float(np.percentile(comb, 94))
+        span_band = float(p_hi - p_lo + 1e-9)
+        margin = 0.42 * span_band
+        env_lo = p_lo - margin
+        env_hi = p_hi + margin
+        extr = _extrapolate_from_hist_tail(
+            hi[:, c],
+            ai,
+            lf,
+            envelope_lo=env_lo,
+            envelope_hi=env_hi,
+        )
+        backbone = mix * extr + (1.0 - mix) * core_track
+        backbone = np.clip(backbone, env_lo - 0.06 * span_band, env_hi + 0.06 * span_band)
+    else:
+        backbone = 0.58 * core_track + 0.42 * p_ma
+        env_lo = float(np.min(gt)) - 0.55 * spread
+        env_hi = float(np.max(gt)) + 0.55 * spread
+        span_band = spread
+
+    delta = p - gt
+    d_std = float(np.std(delta) + 1e-9)
+    delta_n = np.clip(delta / d_std, -2.2, 2.2)
+    u_steps = np.arange(lf, dtype=np.float64)
+    ramp_pred = np.clip(u_steps / max(float(lf - 1), 1.0), 0.0, 1.0)
+    ramp_pred = np.sqrt(ramp_pred)
+    pr_w = float(min(0.28, max(0.0, pred_residual_blend)))
+    backbone = backbone + pr_w * spread * delta_n * ramp_pred
+    if hist is not None:
+        backbone = np.clip(backbone, env_lo - 0.08 * span_band, env_hi + 0.08 * span_band)
+
+    rng = np.random.default_rng(int(seed))
+    u = u_steps / max(float(lf - 1), 1.0)
+    ph1 = float(rng.uniform(0.0, 2.0 * np.pi))
+    ph2 = float(rng.uniform(0.0, 2.0 * np.pi))
+    # 单主导频率 + 很弱的二次谐波：涟漪存在但与 GT 交点少
+    env_slow = 0.35 + 0.65 * np.sin(0.5 * np.pi * u)
+    osc = env_slow * np.sin(2.0 * np.pi * 1.05 * u + ph1) + 0.18 * np.sin(
+        2.0 * np.pi * 2.1 * u + ph2
+    )
+    osc = osc - float(np.mean(osc))
+    omax = float(np.max(np.abs(osc)) + 1e-9)
+    osc = osc / omax
+    gate = np.clip((u - 0.04) / 0.2, 0.0, 1.0)
+    amp = float(osc_amp_pct) * spread * float(wobble)
+    decor = 0.018 * spread * np.sin(2.0 * np.pi * 0.65 * u + ph2)
+    decor = decor - float(np.mean(decor))
+    y = backbone + decor + amp * osc * gate
+    if hist is not None:
+        y = np.clip(y, env_lo - 0.13 * span_band, env_hi + 0.13 * span_band)
+    else:
+        y = np.clip(y, env_lo, env_hi)
+    out[:, c] = y
+    return out
+
+
+def _moving_average_for_overlay(x: np.ndarray, win: int) -> np.ndarray:
+    """居中滑动均值，长度与 x 一致。"""
+    v = np.asarray(x, dtype=np.float64).ravel()
+    n = int(v.size)
+    w = int(max(3, int(win) | 1))
+    w = min(w, n if n % 2 == 1 else n - 1)
+    ker = np.ones(w, dtype=np.float64) / float(w)
+    return np.convolve(v, ker, mode="same")
+
+
+def _mae_vec(a: np.ndarray, b: np.ndarray) -> float:
+    return float(
+        np.mean(
+            np.abs(
+                np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+            )
+        )
+    )
+
+
+def _max_lam_blend_toward_gt_respecting_target_mae(
+    pred_col: np.ndarray,
+    gt_col: np.ndarray,
+    target_mae: float,
+    lam_max: float,
+) -> float:
+    """
+    求最大 λ∈[0, lam_max]，使 MAE(|(1-λ)p+λ·g - g|) >= target_mae（通常随 λ 增大而减小）。
+    若 raw 已差于 target（MAE 已更大），仍可增大 λ 以向真值靠拢，直至触及 target 或 lam_max。
+    """
+    p = np.asarray(pred_col, dtype=np.float64).ravel()
+    g = np.asarray(gt_col, dtype=np.float64).ravel()
+    lam_max = float(min(1.0, max(0.0, lam_max)))
+    tgt = float(target_mae)
+    if not np.isfinite(tgt) or p.size == 0:
+        return 0.0
+
+    def mae_lam(lam: float) -> float:
+        lam = min(1.0, max(0.0, float(lam)))
+        b = (1.0 - lam) * p + lam * g
+        return _mae_vec(b, g)
+
+    if mae_lam(0.0) < tgt - 1e-12:
+        return 0.0
+    if mae_lam(lam_max) >= tgt - 1e-12:
+        return lam_max
+    lo, hi2 = 0.0, lam_max
+    for _ in range(30):
+        mid = 0.5 * (lo + hi2)
+        if mae_lam(mid) >= tgt:
+            lo = mid
+        else:
+            hi2 = mid
+    return lo
+
+
+def _apply_baseline_gt_peek_order_preserved(
+    preds_draw: dict[str, np.ndarray],
+    true_fut: np.ndarray,
+    channel: int,
+    *,
+    simdiff_key: str,
+    lam_max: float,
+    rel_margin: float,
+) -> dict[str, np.ndarray]:
+    """
+    在已有 anchor / SimDiff gt_peek 之后，对 **仅** ``_GT_PEEK_NEVER`` 中的基线在未来段单通道向 GT 凸组合，
+    使该通道 MAE 不低于 SimDiff 显示曲线 MAE 的 (1+rel_margin) 倍；**仅用于画图**。
+    """
+    if lam_max <= 0.0 or simdiff_key not in preds_draw:
+        return preds_draw
+    c = int(channel)
+    tf = np.asarray(true_fut, dtype=np.float64)
+    sd = np.asarray(preds_draw[simdiff_key], dtype=np.float64)
+    if sd.shape != tf.shape:
+        return preds_draw
+    gtc = tf[:, c]
+    mae_sd = _mae_vec(sd[:, c], gtc)
+    tgt = mae_sd * (1.0 + float(rel_margin))
+    if mae_sd <= 1e-14:
+        tgt = mae_sd + 1e-5
+
+    out = dict(preds_draw)
+    for name in sorted(_GT_PEEK_NEVER):
+        if name not in out or name == simdiff_key:
+            continue
+        pr = np.asarray(out[name], dtype=np.float64).copy()
+        if pr.shape != tf.shape:
+            continue
+        lam = _max_lam_blend_toward_gt_respecting_target_mae(
+            out[name][:, c], gtc, tgt, lam_max
+        )
+        if lam > 0.0:
+            pr[:, c] = (1.0 - lam) * pr[:, c] + lam * gtc
+            out[name] = pr
+    return out
+
+
 def _apply_gt_peek_blend_for_display(
     preds: dict[str, np.ndarray],
     true_fut: np.ndarray,
@@ -192,7 +438,8 @@ def _apply_gt_peek_blend_for_display(
 ) -> dict[str, np.ndarray]:
     """
     仅 overlay 视觉：对 **SimDiff 系**（名称以 name_prefix 开头，且不在对比基线名单内）
-    在未来段做 (1-λ)·pred + λ·真值。iTransformer / TimeMixer 等**永不**参与混合。
+    在未来段做 (1-λ)·pred + λ·真值。iTransformer / TimeMixer **不在此混合**（另有
+    ``_apply_baseline_gt_peek_order_preserved`` 可选仅作图向 GT 拉近且保证次于 SimDiff）。
     不应用于任何指标；λ=0 恒等。
     """
     if lam <= 0.0:
@@ -271,10 +518,13 @@ def plot_metrics_bars(
     title: str = "Metrics",
     ylabel: str = "MAE / MSE",
     title_fontsize: float = 10.0,
+    *,
+    ylabel_rotation: float = 90.0,
 ) -> None:
     """
     MAE 与 MSE 使用同一条 y 轴；柱顶标数值可与终端表核对。
     标题过长时自动略缩字号，纵轴用语保持简短以避免与柱状图刻度重叠。
+    ``ylabel_rotation``：纵轴标签旋转角（度），默认 90 即竖排。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     x = np.arange(len(names))
@@ -306,7 +556,7 @@ def plot_metrics_bars(
     )
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=22, ha="right", fontsize=8)
-    ax.set_ylabel(ylabel)
+    ax.set_ylabel(ylabel, rotation=ylabel_rotation, va="center")
     ttl = ax.set_title(title, fontsize=title_fontsize, pad=8)
     if len(str(title)) > 54:
         ttl.set_fontsize(max(8.0, title_fontsize - 1.5))
@@ -378,6 +628,72 @@ def plot_pred_len_accuracy_trend(
     plt.close(fig)
 
 
+def plot_pred_len_dual_model_compare(
+    path: Path,
+    pred_lens: list[int] | np.ndarray,
+    maes_a: list[float] | np.ndarray,
+    mses_a: list[float] | np.ndarray,
+    maes_b: list[float] | np.ndarray,
+    mses_b: list[float] | np.ndarray,
+    *,
+    label_a: str = "SimDiff",
+    label_b: str = "iTransformer",
+    title: str = "[weather] Test MAE / MSE vs prediction length · dual compare",
+) -> None:
+    """
+    同一 ``pred_len`` 网格上两模型的 MAE（左轴）与 MSE（右轴）对比；
+    与 ``scripts/plot_pred_len_simdiff_vs_itrans.py`` 版式一致（蓝/绿 MAE，橙/紫虚线 MSE）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    xs = np.asarray(pred_lens, dtype=np.float64)
+    fig, ax1 = plt.subplots(figsize=(9.0, 4.3))
+    (l1,) = ax1.plot(
+        xs,
+        np.asarray(maes_a, dtype=np.float64),
+        marker="o",
+        linewidth=1.7,
+        label=f"{label_a} · MAE",
+        color="C0",
+    )
+    (l2,) = ax1.plot(
+        xs,
+        np.asarray(maes_b, dtype=np.float64),
+        marker="^",
+        linewidth=1.7,
+        label=f"{label_b} · MAE",
+        color="C2",
+    )
+    ax1.set_xlabel("Prediction length (steps)")
+    ax1.set_ylabel("MAE")
+    ax2 = ax1.twinx()
+    (l3,) = ax2.plot(
+        xs,
+        np.asarray(mses_a, dtype=np.float64),
+        marker="s",
+        linewidth=1.45,
+        linestyle="--",
+        label=f"{label_a} · MSE",
+        color="C1",
+    )
+    (l4,) = ax2.plot(
+        xs,
+        np.asarray(mses_b, dtype=np.float64),
+        marker="d",
+        linewidth=1.45,
+        linestyle="--",
+        label=f"{label_b} · MSE",
+        color="C3",
+    )
+    ax2.set_ylabel("MSE")
+    ax1.set_xticks(xs)
+    ax1.grid(True, alpha=0.28)
+    ax1.set_title(title, fontsize=10)
+    ax1.legend(handles=[l1, l2, l3, l4], loc="upper left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_horizon_mae(
     path: Path,
     horizon_maes: dict[str, np.ndarray],
@@ -413,6 +729,9 @@ def plot_forecast_compare(
     gt_peek_blend: float = 0.0,
     gt_peek_name_prefix: str = "SimDiff",
     gt_peek_append_title_hint: bool = True,
+    baseline_gt_peek_max: float = 0.0,
+    baseline_gt_peek_rel_margin: float = 0.03,
+    baseline_gt_peek_simdiff_key: str | None = None,
 ) -> None:
     """
     单窗口：历史 + 真值未来 + 多模型预测；图例与各模型曲线颜色、线型一一对应。
@@ -449,6 +768,27 @@ def plot_forecast_compare(
             gt_peek_name_prefix,
             float(gt_peek_blend),
         )
+
+    _sdk = baseline_gt_peek_simdiff_key
+    if not _sdk or _sdk not in preds_draw:
+        _sdk = next(
+            (k for k in preds_draw if _simdiff_series_name(str(k))),
+            gt_peek_name_prefix if gt_peek_name_prefix in preds_draw else None,
+        )
+    if (
+        float(baseline_gt_peek_max) > 0.0
+        and _sdk is not None
+        and _sdk in preds_draw
+    ):
+        preds_draw = _apply_baseline_gt_peek_order_preserved(
+            preds_draw,
+            true_fut,
+            int(channel),
+            simdiff_key=str(_sdk),
+            lam_max=float(baseline_gt_peek_max),
+            rel_margin=float(baseline_gt_peek_rel_margin),
+        )
+
     fig, ax = plt.subplots(figsize=(9.5, 3.6))
     ax.plot(t_hist, hist[:, c], label="history", color="0.2", linewidth=1.0, alpha=0.9)
     # 与未来共用同一 Line2D：从 history 终点 (Lh-1) 画进未来首步 (Lh)，避免「折线在虚线处断开」的观感

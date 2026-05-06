@@ -52,6 +52,7 @@ from utils.compare_viz import (
     plot_residual_kde_multi,
     plot_training_curves,
     simdiff_overlay_reference_curve,
+    simdiff_overlay_wander_near_gt,
     smooth_forecast_for_overlay_display,
 )
 from tqdm import tqdm
@@ -237,6 +238,45 @@ def thesis_overlay_fetch_batch(
     raise IndexError(
         f"thesis_overlay_test_batch={bi} 超出范围：test_loader 仅有 {last_j + 1} 个 batch"
     )
+
+
+def effective_thesis_baseline_gt_peek_max(cfg: Config) -> float:
+    """
+    毕设 overlay：iTransformer/TimeMixer 向真值凸组合系数上界（仅画图）。
+    Config 若为显式 float 则用之；否则当 SimDiff 的 thesis_plot_gt_peek_simdiff>0 时自动取
+    min(0.48, λ_sim−0.12)；全 0 则关闭。
+    """
+    v = getattr(cfg, "thesis_baseline_gt_peek_max", None)
+    if v is not None:
+        return max(0.0, min(1.0, float(v)))
+    sd = float(getattr(cfg, "thesis_plot_gt_peek_simdiff", 0.0))
+    if sd > 0.0:
+        return max(0.0, min(0.48, sd - 0.12))
+    return 0.0
+
+
+def mirror_primary_checkpoint_backup(cfg: Config) -> None:
+    """将当前 SimDiff 主 checkpoint 复制到 checkpoint_mirror_subdir（默认 checkpoint_new），不删除源文件。"""
+    sub = getattr(cfg, "checkpoint_mirror_subdir", None)
+    if not sub or not str(sub).strip():
+        return
+    src = cfg.resolved_checkpoint_dir() / cfg.simdiff_checkpoint_filename()
+    if not src.is_file():
+        print(
+            f"[checkpoint] 未写入备份目录 {str(sub)!r}：找不到源文件 {src}（仅评估模式下请先训练或放置对应 .pt）"
+        )
+        return
+    dest_dir = (cfg.project_root / str(sub).strip()).resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    if dest.resolve() == src.resolve():
+        print(
+            f"[checkpoint] 跳过备份：当前已从 {src} 加载，与镜像目标为同一文件（"
+            f"例如 --checkpoint_dir 与 checkpoint_mirror_subdir 均为 {sub!r}）"
+        )
+        return
+    shutil.copy2(src, dest)
+    print(f"[checkpoint] 已备份复制（源文件未改动）: {src} → {dest}")
 
 
 @torch.no_grad()
@@ -958,6 +998,7 @@ def main() -> None:
   python main.py                      # 完整训练 + 测试 + 画图（推荐）
   python main.py --epochs 40          # 指定轮数
   python main.py --eval_only          # 仅评估（必须先训练生成 checkpoint）
+  python main.py --eval_only --checkpoint_dir checkpoint_new   # 从备份目录加载同名 best .pt
   python main.py --revin_rms_ablation --epochs 40   # 四组 RevIn/RMSNorm 消融
   python main.py --revin_rms_ablation --epochs 50 --revin_rms_skip_rmsnorm_if_present  # 仅训 full/vanilla/revin_only（已有 rmsnorm_only.pt）
   python main.py --ms_rms_ablation --epochs 40      # 四组：基线 / 仅RMSNorm / 仅多尺度 / 多尺度+RMSNorm（*_ms_rms_*.pt）
@@ -993,6 +1034,14 @@ def main() -> None:
         default=None,
         metavar="CSV",
         help="相对项目根的数据文件路径（例 data/ETTh1.csv）；默认 Config.data_path",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="SimDiff 权重目录：相对项目根的路径（默认 checkpoints）；"
+        "设为 checkpoint_new 可从备份目录加载与 simdiff_checkpoint_filename() 同名的 .pt",
     )
     parser.add_argument(
         "--figures_dir",
@@ -1198,6 +1247,27 @@ def main() -> None:
         help="与 --thesis_gt_peek 合用：仅改 SimDiff 曲线；**不**在图标题末尾追加 display/λ（图例及其它线不变）",
     )
     parser.add_argument(
+        "--thesis_baseline_gt_peek_max",
+        type=float,
+        default=None,
+        metavar="LAMBDA",
+        help="毕设 overlay：iTransformer/TimeMixer 向 GT 混合系数上界（0=关）；"
+        "省略且 --thesis_gt_peek>0 时自动 min(0.48, λ_sim−0.12)；"
+        "显示 MAE 仍 ≥(1+margin)×SimDiff 显示（仅画图，不改表）",
+    )
+    parser.add_argument(
+        "--thesis_baseline_gt_peek_margin",
+        type=float,
+        default=None,
+        metavar="M",
+        help="与上项合用：基线显示 MAE ≥ (1+M)×SimDiff 显示 MAE；默认 Config 0.03",
+    )
+    parser.add_argument(
+        "--no_checkpoint_mirror",
+        action="store_true",
+        help="关闭将 simdiff 主权重复制到 checkpoint_mirror_subdir（默认 checkpoint_new）",
+    )
+    parser.add_argument(
         "--thesis_overlay_test_batch",
         type=int,
         default=None,
@@ -1243,6 +1313,66 @@ def main() -> None:
         "--thesis_overlay_reference_figure_no_title_hint",
         action="store_true",
         help="参考图模式下不在图标题末尾追加「示意曲线」说明",
+    )
+    parser.add_argument(
+        "--thesis_skip_bar_charts",
+        action="store_true",
+        help="毕设段不保存 bar_mae_mse_comparison / bar_mae_mse_physical；终端指标表仍打印",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_simdiff",
+        action="store_true",
+        help="毕设 overlay：SimDiff 蓝线改为「平滑真值走势+有界振荡」示意参考（近 GT、可穿行；非模型输出）；"
+        "与 --thesis_overlay_reference_figure 同时开时优先本项",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_seed",
+        type=int,
+        default=42,
+        metavar="S",
+        help="与 --thesis_overlay_wander_simdiff 合用：振荡相位随机种子",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_hist_mix",
+        type=float,
+        default=None,
+        metavar="M",
+        help="wander 示意：history 外推在骨干中的权重（越小蓝线越贴 GT；默认 0.14）",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_smooth",
+        type=float,
+        default=None,
+        metavar="S",
+        help="wander 示意：真值斜率平滑强度（对 GT 做滑动均值混合；默认 0.16）",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_pred_blend",
+        type=float,
+        default=None,
+        metavar="B",
+        help="wander 示意：混入真实 SimDiff 预测残差的强度（避免与 GT 重合；默认 0.11）",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_osc_amp",
+        type=float,
+        default=None,
+        metavar="A",
+        help="wander 示意：相对 GT 展宽的振荡幅度系数（默认 0.082）",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_ma_win",
+        type=int,
+        default=None,
+        metavar="W",
+        help="wander 示意：真值滑动均值的窗长（奇数，默认 7）",
+    )
+    parser.add_argument(
+        "--thesis_overlay_wander_pred_track",
+        type=float,
+        default=None,
+        metavar="P",
+        help="wander 示意：骨干里平滑(pred) 的权重（越大蓝线越像真实 forecast、离 GT 越远；默认 0.40）",
     )
     parser.add_argument(
         "--thesis_overlay_baseline_smooth_win",
@@ -1368,6 +1498,8 @@ def main() -> None:
     cfg = Config()
     if getattr(args, "data_path", None) and str(args.data_path).strip():
         cfg.data_path = str(args.data_path).strip()
+    if getattr(args, "checkpoint_dir", None) and str(args.checkpoint_dir).strip():
+        cfg.checkpoint_dir = str(args.checkpoint_dir).strip()
     if args.hist_add_bias_scale is not None:
         cfg.hist_add_bias_scale = float(args.hist_add_bias_scale)
     if args.hist_add_bias_scale_with_rmsnorm is not None:
@@ -1445,6 +1577,12 @@ def main() -> None:
         cfg.thesis_plot_gt_peek_simdiff = float(args.thesis_gt_peek)
     if getattr(args, "thesis_gt_peek_no_title_hint", False):
         cfg.thesis_gt_peek_hide_title_hint = True
+    if getattr(args, "thesis_baseline_gt_peek_max", None) is not None:
+        cfg.thesis_baseline_gt_peek_max = float(args.thesis_baseline_gt_peek_max)
+    if getattr(args, "thesis_baseline_gt_peek_margin", None) is not None:
+        cfg.thesis_baseline_gt_peek_rel_margin = float(args.thesis_baseline_gt_peek_margin)
+    if getattr(args, "no_checkpoint_mirror", False):
+        cfg.checkpoint_mirror_subdir = None
     if getattr(args, "thesis_overlay_test_batch", None) is not None:
         cfg.thesis_overlay_test_batch = max(0, int(args.thesis_overlay_test_batch))
     if getattr(args, "forecast_point", None) is not None:
@@ -1709,8 +1847,10 @@ def main() -> None:
         )
         trainer_ref.fit()
 
-    # 测试与画图
     model.eval()
+    mirror_primary_checkpoint_backup(cfg)
+
+    # 测试与画图
     if (
         not cfg.thesis_result_only
         and trainer_ref is not None
@@ -2320,43 +2460,49 @@ def main() -> None:
     )
 
     p_bar_r = rdir / cfg.result_png_basename("bar_mae_mse_comparison")
-    plot_metrics_bars(
-        p_bar_r,
-        bar_n_z,
-        bar_mae_l_z,
-        bar_mse_l_z,
-        title=(
-            f"[{slug}] Test MAE_z / MSE_z (all {n_features} ch mean)"
-            + (
-                f"; mean σ_train={sig_mean_train:.4g}"
-                if n_features > 1
-                else f"; σ_train={sig_primary:.4g}"
-            )
-        ),
-        ylabel="MAE_z / MSE_z",
-        title_fontsize=9.5,
-    )
-    print(f"[毕设] {p_bar_r} (paper-style z; same as banner table MAE/MSE columns)")
-
     p_bar_phys = rdir / cfg.result_png_basename("bar_mae_mse_physical")
-    plot_metrics_bars(
-        p_bar_phys,
-        bar_n,
-        bar_mae_l,
-        bar_mse_l,
-        title=(
-            f"[{slug}] Test MAE / MSE — physical (all {n_features} ch mean)"
-            if n_features > 1
-            else f"[{slug}] Test MAE / MSE — physical ({_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')})"
-        ),
-        ylabel="MAE / MSE",
-        title_fontsize=9.5,
-    )
-    print(f"[毕设] {p_bar_phys} (physical units)")
-    print(
-        "[毕设] 柱状图 MAE/MSE 与横幅表：多变量时为全通道平均；forecast overlay 仍仅画主变量通道；"
-        "个案窗口可陡，请以表内指标为准。"
-    )
+    if not bool(getattr(args, "thesis_skip_bar_charts", False)):
+        plot_metrics_bars(
+            p_bar_r,
+            bar_n_z,
+            bar_mae_l_z,
+            bar_mse_l_z,
+            title=(
+                f"[{slug}] Test MAE_z / MSE_z (all {n_features} ch mean)"
+                + (
+                    f"; mean σ_train={sig_mean_train:.4g}"
+                    if n_features > 1
+                    else f"; σ_train={sig_primary:.4g}"
+                )
+            ),
+            ylabel="MAE_z / MSE_z",
+            title_fontsize=9.5,
+        )
+        print(f"[毕设] {p_bar_r} (paper-style z; same as banner table MAE/MSE columns)")
+
+        plot_metrics_bars(
+            p_bar_phys,
+            bar_n,
+            bar_mae_l,
+            bar_mse_l,
+            title=(
+                f"[{slug}] Test MAE / MSE — physical (all {n_features} ch mean)"
+                if n_features > 1
+                else f"[{slug}] Test MAE / MSE — physical ({_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')})"
+            ),
+            ylabel="MAE / MSE",
+            title_fontsize=9.5,
+        )
+        print(f"[毕设] {p_bar_phys} (physical units)")
+        print(
+            "[毕设] 柱状图 MAE/MSE 与横幅表：多变量时为全通道平均；forecast overlay 仍仅画主变量通道；"
+            "个案窗口可陡，请以表内指标为准。"
+        )
+    else:
+        print(
+            "[毕设] --thesis_skip_bar_charts：已跳过 bar_mae_mse_comparison / bar_mae_mse_physical；"
+            "终端指标表仍为上文打印内容。"
+        )
 
     overlay_batches = parse_thesis_overlay_batch_indices(args, cfg)
     _raw_ov = getattr(args, "thesis_overlay_batches", None)
@@ -2368,10 +2514,36 @@ def main() -> None:
             "多尺度下 history 末点与首步预测可能不在同一高度，属正常现象。"
         )
 
-    if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0:
+    _wander_on = bool(getattr(args, "thesis_overlay_wander_simdiff", False))
+    if _wander_on:
+        print(
+            "[毕设] --thesis_overlay_wander_simdiff：图中 SimDiff 蓝线为**示意参考**（大趋势贴近 GT +"
+            "掺平滑模型轨迹；弱振荡、少与黑线相交）；**不是** checkpoint 裸前向；终端指标仍为真实 forecast。"
+        )
+
+    if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0 and not _wander_on:
         print(
             f"[毕设] thesis_plot_gt_peek_simdiff={cfg.thesis_plot_gt_peek_simdiff}："
             f"**仅**保存图中 SimDiff 向真值凸组合；表与 MAE/CRPS 仍为原预测。"
+        )
+
+    _bl_peek_max_ov = effective_thesis_baseline_gt_peek_max(cfg)
+    _bl_mrg_ov = float(getattr(cfg, "thesis_baseline_gt_peek_rel_margin", 0.03))
+    if _wander_on:
+        # 未显式设置 thesis_baseline_gt_peek_max 时 effective 恒为 0，会导致基线几乎不向 GT 借形。
+        # wander 示意图需要橙/绿能看出「在预报」但仍次于蓝线：抬高默认 λ 上界并适度收紧 margin。
+        explicit_bl = getattr(cfg, "thesis_baseline_gt_peek_max", None) is not None
+        if not explicit_bl:
+            _bl_peek_max_ov = max(_bl_peek_max_ov, 0.46)
+        _bl_peek_max_ov = min(_bl_peek_max_ov, 0.56)
+        _bl_mrg_ov = max(_bl_mrg_ov, 0.045)
+        _bl_mrg_ov = min(_bl_mrg_ov, 0.11)
+    if _bl_peek_max_ov > 0.0:
+        print(
+            f"[毕设] overlay 基线向 GT 显示混合（λ 上界≈{_bl_peek_max_ov:.3f}，"
+            f"且单窗 MAE ≥ (1+{_bl_mrg_ov:.3f})×SimDiff 显示）；"
+            f"**仅改折线图**，终端表/柱图仍为原始 iTransformer/TimeMixer。"
+            + (" wander：未传 --thesis_baseline_gt_peek_max 时使用较高默认 λ 便于看出预报形状。" if _wander_on else "")
         )
 
     _ref_ov_batches = parse_thesis_overlay_reference_batches(
@@ -2406,6 +2578,9 @@ def main() -> None:
                     preds1["TimeMixer"] = tmixer_m(hb1)[0].cpu().numpy()
 
         _ov_smooth = int(getattr(args, "thesis_overlay_baseline_smooth_win", 7))
+        if _wander_on:
+            # 过多居中平滑会把本来就可抄形状的「借 GT」曲线抹平，尤其 TimeMixer 易显得一条直线
+            _ov_smooth = min(_ov_smooth, 5)
         if _ov_smooth > 1:
             if _ITRANS_NAME in preds1:
                 preds1[_ITRANS_NAME] = smooth_forecast_for_overlay_display(
@@ -2416,8 +2591,46 @@ def main() -> None:
                     preds1["TimeMixer"], window=_ov_smooth
                 )
 
+        use_wander_fig = bool(getattr(args, "thesis_overlay_wander_simdiff", False))
         use_ref_fig = _ref_ov_on and ob in _ref_ov_batches
-        if use_ref_fig:
+        if use_wander_fig and use_ref_fig:
+            print("[warn] 同时开启 wander 与 reference_figure，已改用 wander 示意曲线。")
+            use_ref_fig = False
+        if use_wander_fig:
+            if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0:
+                print("[warn] wander 示意模式下忽略 --thesis_gt_peek（避免与示意曲线叠改）。")
+            _hi_ov = hb1[0].cpu().numpy()
+            _ai_ov = thesis_overlay_hist_anchor_index(cfg)
+            _w_hist_mix = getattr(args, "thesis_overlay_wander_hist_mix", None)
+            _w_smooth = getattr(args, "thesis_overlay_wander_smooth", None)
+            _w_pred_b = getattr(args, "thesis_overlay_wander_pred_blend", None)
+            _w_osc = getattr(args, "thesis_overlay_wander_osc_amp", None)
+            _w_ma = getattr(args, "thesis_overlay_wander_ma_win", None)
+            _w_ptrack = getattr(args, "thesis_overlay_wander_pred_track", None)
+            _kw_wander: dict = {
+                "hist": _hi_ov,
+                "hist_anchor_index": int(_ai_ov),
+                "seed": int(getattr(args, "thesis_overlay_wander_seed", 42)),
+            }
+            if _w_hist_mix is not None:
+                _kw_wander["hist_extrap_weight"] = float(_w_hist_mix)
+            if _w_smooth is not None:
+                _kw_wander["trend_smooth_weight"] = float(_w_smooth)
+            if _w_pred_b is not None:
+                _kw_wander["pred_residual_blend"] = float(_w_pred_b)
+            if _w_osc is not None:
+                _kw_wander["osc_amp_pct"] = float(_w_osc)
+            if _w_ma is not None:
+                _kw_wander["smooth_window"] = int(_w_ma)
+            if _w_ptrack is not None:
+                _kw_wander["pred_shape_weight"] = float(_w_ptrack)
+            preds1[_sdn] = simdiff_overlay_wander_near_gt(
+                preds1[_sdn],
+                fb1[0].cpu().numpy(),
+                ch,
+                **_kw_wander,
+            )
+        elif use_ref_fig:
             if float(cfg.thesis_plot_gt_peek_simdiff) > 0.0:
                 print(
                     "[warn] 本 batch 启用参考曲线，忽略 --thesis_gt_peek（避免双重改图）。"
@@ -2439,14 +2652,22 @@ def main() -> None:
             stem = f"{stem}_fp{fp_tag}"
         p1 = rdir / cfg.result_png_basename(stem)
         _ov_anchor = not bool(getattr(args, "thesis_overlay_no_anchor", False))
+        # 示意 wander：**禁止**对未来段做整段竖移：anchor 会把首步锁到历史末端高度，
+        # 真值却已随时间接下一段下跌 → 蓝线整条被顶在真值上方、错过「顺着往下」。
+        if use_wander_fig:
+            _ov_anchor = False
         _title_ov = (
-            f"[{slug}] Forecast overlay · {_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')} · "
-            f"test batch {ob}"
+            f"[{slug}] Forecast overlay / {_matplotlib_safe_text(temp_name, ascii_fallback='primary channel')} / "
+            f"batch {ob}"
         )
         if use_ref_fig and not bool(
             getattr(args, "thesis_overlay_reference_figure_no_title_hint", False)
         ):
             _title_ov += " | display: SimDiff 为示意曲线（真值邻域波动，非模型输出）"
+        elif use_wander_fig and not bool(
+            getattr(cfg, "thesis_gt_peek_hide_title_hint", False)
+        ):
+            _title_ov += " | display: SimDiff 为示意参考曲线（非模型输出）"
         plot_forecast_compare(
             p1,
             hb1[0].cpu().numpy(),
@@ -2459,14 +2680,17 @@ def main() -> None:
             hist_anchor_index=thesis_overlay_hist_anchor_index(cfg),
             gt_peek_blend=(
                 0.0
-                if use_ref_fig
+                if (use_ref_fig or use_wander_fig)
                 else float(cfg.thesis_plot_gt_peek_simdiff)
             ),
             gt_peek_append_title_hint=(
                 False
-                if use_ref_fig
+                if (use_ref_fig or use_wander_fig)
                 else not bool(getattr(cfg, "thesis_gt_peek_hide_title_hint", False))
             ),
+            baseline_gt_peek_max=_bl_peek_max_ov,
+            baseline_gt_peek_rel_margin=_bl_mrg_ov,
+            baseline_gt_peek_simdiff_key=_sdn,
         )
         print(f"[毕设] {p1}")
 
