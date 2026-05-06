@@ -1,0 +1,201 @@
+================================================================================
+SimDiff-Weather 毕设项目总结（全文叙述）
+================================================================================
+生成依据：docs/DEVELOPMENT_LOG.md、docs/EXPERIMENT_ARCHITECTURE.md、
+          docs/multiscale_history_and_dataset_calendar.md、
+          docs/multivariate_vs_univariate_forecasting.md、docs/tell.md
+说明：架构细节以 tell.md 与当前代码为准；EXPERIMENT_ARCHITECTURE 中部分历史
+      条目（如 FiLM、部分 dual 命名）已在后续迭代中调整，下文按开发日志与
+      tell 的现行描述归纳。
+
+--------------------------------------------------------------------------------
+一、项目做了什么（研究问题与目标）
+--------------------------------------------------------------------------------
+
+本项目在「表格型时间序列」（CSV：按时间排序的多维或单维序列）上，实现并
+扩展了条件扩散模型 SimDiff（SimDiff-Weather）用于多步前瞻预报：给定固定
+长度的历史窗口 hist，预测未来 pred_len 步的序列。默认关注气象/能源类数据
+（如 weather.csv、wind.csv），并支持与公开数据集（ETTh1、ETTm1、exchange_rate
+等）相同的管线。
+
+与仅做点估计的判别式模型不同，SimDiff 在意图上对「归一化后的未来轨迹」
+建模分布：训练阶段学习去噪网络预测扩散噪声；推理阶段通过 DDIM/DDPM 反过程
+采样 K 条未来轨迹，再用 Median-of-Means（MoM）等聚合得到点预测，并报告
+概率型指标（如 CRPS、样本方差 VAR）。项目在同一数据划分下，将 SimDiff 与
+学习型基线 iTransformer、TimeMixer 对比，并维护毕设级输出：终端指标表、
+柱状对比图、历史+真值+多模型预测的 overlay 折线图等。
+
+除「主模型 + 基线」外，仓库还实现了多组消融与工程增强（RevIn/RMSNorm、
+多尺度历史拼接、ms_rms 四柱消融、训练 AMP、EMA、z 口径指标主表等），便于
+论文撰写与复现。
+
+
+--------------------------------------------------------------------------------
+二、主要内容（技术模块与实验内容）
+--------------------------------------------------------------------------------
+
+1. 数据与窗口
+   • 从 CSV 读入数值矩阵；默认可仅保留「气温类」目标列或 OT 列（单变量），
+     或通过 --all_features 保留全部数值列（多变量联合预测）。
+   • WeatherWindowDataset 做滑动窗：(hist, fut)；hist 与 fut 在时间上衔接，
+     不使用未来标签构造条件（避免泄漏）。
+   • 默认 seq_len=96、pred_len=24（可与权重 checkpoint 绑定；改 pred_len 需
+     对应重训）。
+
+2. 多尺度历史（可选，当前默认常开启）
+   • 将 hist 不仅限于最近 seq_len 步细粒度序列，还在预测边界左侧按日历语义
+     拼接「日尺度」7 个均值 token 与「周尺度」4 个均值 token，总长
+     Lh = seq_len + 11。
+   • 日历依赖「一行对应多长时间」：ETTh  hourly、ETTm/wind 15min、
+     exchange_rate 日频等通过 steps_per_hour、steps_per_day 等解析；错误
+     日历会导致池化块的物理含义错位，须与数据文件名/stem 规则一致。
+   • NI 在历史归一化时可用 hist_stats_span=seq_len，仅用细粒度前缀估计 μ_h、
+     σ_h，再标准化整段 hist，避免池化尾段污染条件尺度。
+
+3. Normalization Independence（NI）
+   • 历史与未来分别在各自时间维上估计 μ/σ，互不混用。
+   • 训练目标在 normalize_future(future) 得到的 z-score 空间上做扩散；
+     评估时若已知真值 future，反变换与该窗 μ_f、σ_f 一致；开环推理则使用
+     训练集上估计的「未来边际」统计量。
+
+4. SimDiff 核心：GaussianDiffusion + DenoiserTransformer
+   • 余弦型噪声日程；训练优化噪声预测（可含 MSE/Huber、L1、时间差分、
+     x0 辅助项等权重，见 Config）。
+   • 去噪网络将历史与未来 token 拼接，注入扩散时间步嵌入；可选潜空间
+     RevIN（与 NI 分层）或 HistoryAdditiveBias（历史加性偏置）；编码器可选
+     原生 TransformerEncoder+LayerNorm 或 Pre-RMSNorm 自定义层堆叠。
+   • 推理默认 DDIM；可半精度 forecast_amp 加速采样。
+
+5. K 样本与 MoM
+   • 对同一条件并行（或展开）采样 K 条轨迹；归一化空间内 Median-of-Means
+     得点预测，再逆变换到物理尺度；可选「低温加权」与 MoM 凸组合减轻冷尾
+     平滑。
+   • simdiff_ablation 可切换 ni_only / mom_only 等与 NI/MoM 语义相关的评估
+     路径（与去噪器结构消融正交）。
+
+6. 基线与公平性说明
+   • 学习型基线：iTransformer、TimeMixer；在同一 DataLoader 上训练与评估。
+   • 多尺度开启时，默认基线仅消费 hist 前 seq_len（BaselineHistTrim），弱于
+     SimDiff 全长条件；可选 baseline_use_full_hist 等与论文叙述对齐。
+   • 点预测基线：CRPS 在 δ(预测) 下与 MAE 数值一致；VAR=0。
+
+7. 毕设产出与指标
+   • 终端表：主表常为论文口径 MAE_z、MSE_z（除以训练集 σ）；物理尺度可为副
+     表；SimDiff 报告 CRPS、VAR（z 空间可并行）。
+   • 图：bar_mae_mse_comparison、forecast_curves_overlay 等；结果目录依
+     数据集可为 result/<stem>/、wind/、exchange/ 或通过 --figures_dir 指定。
+   • 消融套件示例：--revin_rms_ablation（RevIn×RMSNorm 四柱）、
+     --ms_rms_ablation（多尺度×RMSNorm 四柱，含 xiaorong/ 归档图）、
+     pred_len 扫描脚本、SimDiff vs iTransformer 折线对比脚本等。
+
+8. 单变量 vs 多变量（尤其 Wind）
+   • 默认 temperature_only：Wind 常只保留 OT，C=1。
+   • --all_features：多通道 MIMO，监督为整段 (Lf, C)；图表与主叙事仍常聚焦
+     OT 通道；单变量与多变量 checkpoint 结构不同，不可混用。
+
+
+--------------------------------------------------------------------------------
+三、采用的主要方法（方法论层面）
+--------------------------------------------------------------------------------
+
+• 条件扩散模型（Denoising Diffusion）：对未来归一化序列加噪并学习去噪。
+• Transformer 架构的去噪网络：自注意力建模历史与未来 token 的长程依赖。
+• 归一化独立性（NI）：历史与未来分离标准化，明确训练与评估反变换语义。
+• DDIM（及可选 DDPM）采样：从噪声反推到未来轨迹；步数、eta 可配置。
+• 集合预报聚合：Median-of-Means、可选冷尾加权；ni_only 路径为样本均值。
+• 对比学习式基线：iTransformer（变量维 token）、TimeMixer 式多尺度融合
+  的精简实现。
+• 多尺度信号处理思想：在时间维拼接细粒度 + 日/周池化摘要作为条件（非在
+  loss 中单独加多尺度项）。
+• 工程与训练技巧：混合精度训练、EMA 权重、可选稀疏验证集 forecast MAE
+  选优、checkpoint meta 追溯配置。
+• 评估：点误差 MAE/MSE（物理与 z 口径）、概率 CRPS、预报样本方差 VAR。
+
+
+--------------------------------------------------------------------------------
+四、整个项目框架（代码与数据流）
+--------------------------------------------------------------------------------
+
+目录/模块职责概要：
+
+• config/config.py
+  超参数、路径、扩散步数、多尺度与 checkpoint 命名（含后缀防覆盖）、
+  MoM/训练损失权重等。
+
+• main.py
+  CLI 组装 Config；make_loaders；构建 SimDiffWeather 与 Trainer；训练或
+  --eval_only；测试集 evaluate_test_loader_prob_combined（合并 MAE/MSE/
+  CRPS/VAR）；训练基线；compare_viz / result_output 写图与表；分支执行
+  各类消融套件。
+
+• utils/data_loader.py
+  CSV→矩阵；时间顺序划分 train/val/test；滑动窗；多尺度 _concat_multiscale_history；
+  训练集未来边际统计写入 cfg；multiscale_steps_per_hour/day 与
+  hist_window_start_min。
+
+• utils/independent_normalizer.py
+  NI：normalize_history / normalize_future / inverse_transform_future；
+  mom_aggregate_normalized（含 cold-bias 旋钮）。
+
+• models/diffusion.py
+  GaussianDiffusion：前向 q_sample、training_losses、sample/_ddim_step、
+  推理半精度钩子。
+
+• models/network.py + models/revin_rms.py
+  DenoiserTransformer：token 拼接、时间步嵌入、可选 RevIN 或 HistoryAdditiveBias、
+  TransformerEncoder 或 RMSNorm 预归一化层栈、未来段 out_proj。
+
+• models/simdiff.py
+  SimDiffWeather：training_loss、forecast（K 采样→MoM→反变换）、
+  point_prediction_from_forecast、与 ni_only/mom_only 等消融一致的路径。
+
+• utils/trainer.py
+  训练循环、验证噪声损失、早停、AMP、EMA、保存 checkpoint 与 meta。
+
+• utils/baselines.py
+  iTransformer、TimeMixer、HistTrim、评估函数与 z 口径指标。
+
+• utils/compare_viz.py / utils/result_output.py / utils/prob_metrics.py
+  可视化与终端表、CRPS 等。
+
+• verify_norm_mom.py
+  NI + MoM 快速自检。
+
+• scripts/
+  pred_len 趋势、手动 CSV 绑图、SimDiff vs iTransformer 叠加等辅助脚本。
+
+数据—训练—推理逻辑链（简化）：
+
+  CSV → DataLoader(hist, fut) 
+    → NI：hist_n, fut_n（训练目标在 fut_n 空间）
+    → DenoiserTransformer + GaussianDiffusion 优化噪声预测
+    → checkpoint
+    → forecast：K×DDIM 采样 → MoM（归一化空间）→ inverse_transform_future
+    → 与基线同集对比 MAE/MSE/CRPS/VAR 与图表。
+
+--------------------------------------------------------------------------------
+五、毕设写作时可强调的「创新或工作量」落点
+--------------------------------------------------------------------------------
+
+• 将扩散概率预报落地到表格气象/能源时间序列，并与较新判别式基线系统对比。
+• NI + 多尺度条件 + 可选 RevIn/RMSNorm/历史偏置的工程整合与可视化对齐
+  （含多尺度时间轴、overlay 衔接等与论文图表可信度相关的修复记录）。
+• 多数据集（weather、wind、ETT、exchange_rate）与单变量/多变量 Wind 的
+  一致管线及 checkpoint 命名约定。
+• 消融与指标：ms_rms 或 RevIn/RMS 四组、z 口径主表、概率指标与点基线
+  退化关系说明。
+
+
+--------------------------------------------------------------------------------
+六、文档与代码溯源建议
+--------------------------------------------------------------------------------
+
+• 全局算法与 wind/OT 实例：docs/tell.md
+• 每次结构/行为变更与命令：docs/DEVELOPMENT_LOG.md
+• 多尺度日历与换数据集清单：docs/multiscale_history_and_dataset_calendar.md
+• Wind 单变量 vs 多变量：docs/multivariate_vs_univariate_forecasting.md
+• 去噪器开关/消融表（注意与日志中 ms_rms 主线对照）：docs/EXPERIMENT_ARCHITECTURE.md
+
+================================================================================
+（完）
+================================================================================
